@@ -1,0 +1,13 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  schema-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npx ajv compile --spec=draft2020 -c ajv-formats -s schemas/challenge.schema.json
+      - run: npx ajv compile --spec=draft2020 -c ajv-formats -s schemas/receipt.schema.json
