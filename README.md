@@ -1,6 +1,6 @@
 # x402 Concordium-aware Facilitator (XCF)
 
-**XCF Consists of UFX + CRP**
+**XCF Consists of:**
 - **UFX (Universal Facilitator for x402):** rail-agnostic core that exposes the x402-friendly API, enforces idempotency/expiry, orchestrates policy checks, signs verifiable receipts (JWS), and emits webhooks/metrics.
 - **CRP (Concordium Rail Plugin):** rail-specific adapter that reads **finalized** Concordium PLT (protocol-level token) events via gRPC v2 and matches exact payments.
 
@@ -21,15 +21,11 @@ A payer scans a QR (or taps NFC), sends the exact PLT amount to the `pay_to` add
 - **Auth everywhere:** all facilitator endpoints require auth; CORS allow-list enforced.
 
 ---
-
-```
-
-md
 # 🧱 Architecture (layered)
-<div align="center">
-  img src="images/XCF Architecture.png" alt="XCF Layered Architecture" width="500">
+<p align="center">
+  <img src="images/XCF_Architecture.png" alt="XCF Layered Architecture" width="500">
+</p>
 
-markdown
 # 🛣️ API (public, auth required)
 
 - `POST /v1/challenges` — register a challenge (idempotent by `nonce`)
@@ -43,8 +39,8 @@ markdown
 **`/supported` example**
 ```json
 {"schemes":["exact"],"networks":["concordium:testnet","concordium:mainnet"],"assets":[{"type":"PLT","tokenId":"USDQ","decimals":2}]}
-````
 
+```
 ---
 
 # 📦 Data contracts (canonical)
