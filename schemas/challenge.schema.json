@@ -1,0 +1,26 @@
+{
+  "$id": "https://xcf/schemas/challenge.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["network", "asset", "amount", "pay_to", "expiry", "nonce"],
+  "properties": {
+    "network": { "type": "string", "pattern": "^concordium:(testnet|mainnet)$" },
+    "asset": {
+      "type": "object",
+      "required": ["type", "tokenId", "decimals"],
+      "properties": {
+        "type": { "const": "PLT" },
+        "tokenId": { "type": "string", "minLength": 1 },
+        "decimals": { "type": "integer", "minimum": 0, "maximum": 18 }
+      },
+      "additionalProperties": false
+    },
+    "amount": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]{1,18})?$" },
+    "pay_to": { "type": "string", "minLength": 1 },
+    "expiry": { "type": "string", "format": "date-time" },
+    "nonce": { "type": "string", "minLength": 1 },
+    "policy": { "type": "object" },
+    "metadata": { "type": "object" }
+  },
+  "additionalProperties": false
+}

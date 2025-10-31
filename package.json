@@ -1,0 +1,29 @@
+{
+  "name": "xcf-concordium-facilitator",
+  "version": "1.0.0",
+  "description": "**XCF Consists of:**\r - **UFX (Universal Facilitator for x402):** rail-agnostic core that exposes the x402-friendly API, enforces idempotency/expiry, orchestrates policy checks, signs verifiable receipts (JWS), and emits webhooks/metrics.\r - **CRP (Concordium Rail Plugin):** rail-specific adapter that reads **finalized** Concordium PLT (protocol-level token) events via gRPC v2 and matches exact payments.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "schema:check": "ajv compile --spec=draft2020 -c ajv-formats -s schemas/challenge.schema.json && ajv compile --spec=draft2020 -c ajv-formats -s schemas/receipt.schema.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rgraulus/xcf-concordium-facilitator.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/rgraulus/xcf-concordium-facilitator/issues"
+  },
+  "homepage": "https://github.com/rgraulus/xcf-concordium-facilitator#readme",
+  "devDependencies": {
+    "ajv": "^8.17.1",
+    "ajv-cli": "^5.0.0",
+    "ajv-formats": "^3.0.1"
+  }
+}
