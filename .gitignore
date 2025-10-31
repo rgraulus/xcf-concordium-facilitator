@@ -137,3 +137,22 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# --- Editors & OS (add)
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# --- Env & secrets (add)
+secrets.*
+*.pem
+
+# --- Replit (add)
+# Keep .replit and replit.nix tracked; this ignores only transient caches
+.replit-cache/
+
+# --- Local DB/test artifacts (add)
+*.sqlite*
+dump.sql
