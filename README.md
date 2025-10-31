@@ -23,8 +23,9 @@ A payer scans a QR (or taps NFC), sends the exact PLT amount to the `pay_to` add
 ---
 
 # 🧱 Architecture (layered)
-markdown
-![XCF Layered Architecture](images/XCF Architecture.png)
+html
+<div align="center">
+  img src="images/XCF Architecture.png" alt="XCF Layered Architecture" width="500">
 
 # 🛣️ API (public, auth required)
 
