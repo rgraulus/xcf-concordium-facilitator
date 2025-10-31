@@ -1,3 +1,30 @@
+# x402 Concordium-aware Facilitator (XCF)
+
+**XCF Consists of UFX + CRP**
+- **UFX (Universal Facilitator for x402):** rail-agnostic core that exposes the x402-friendly API, enforces idempotency/expiry, orchestrates policy checks, signs verifiable receipts (JWS), and emits webhooks/metrics.
+- **CRP (Concordium Rail Plugin):** rail-specific adapter that reads **finalized** Concordium PLT (protocol-level token) events via gRPC v2 and matches exact payments.
+
+> **PoC scope:** No custody; no on-chain contracts. Finality-only, exact amount matching, signed receipts, and minimal merchant integration (webhook + polling).
+
+---
+
+## ✨ Demo outcome
+A payer scans a QR (or taps NFC), sends the exact PLT amount to the `pay_to` address, and the terminal shows a **green check** as soon as XCF issues a signed receipt.
+
+---
+
+## 📐 Hard guarantees
+- **Finality-only:** match only transactions in **last-finalized** blocks (no mempool/pending).
+- **Exact tuple match:** `{ tokenId, to, amountMinor }`, where `amountMinor = toMinorUnits(amount, decimals)`; **no slippage**.
+- **Idempotency:** same `nonce` + identical payload ⇒ same outcome; same `nonce` + different payload ⇒ **422**.
+- **Verifiable receipts:** JWS with `kid`, JWKS published at `/.well-known/jwks.json`.
+- **Auth everywhere:** all facilitator endpoints require auth; CORS allow-list enforced.
+
+---
+
+## 🧱 Architecture (layered)
+
+
 ```markdown
 # XCF — x402 Concordium Facilitator (UFX + CRP)
 
