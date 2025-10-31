@@ -21,7 +21,10 @@ A payer scans a QR (or taps NFC), sends the exact PLT amount to the `pay_to` add
 - **Auth everywhere:** all facilitator endpoints require auth; CORS allow-list enforced.
 
 ---
-markdown
+
+```
+
+md
 # 🧱 Architecture (layered)
 <div align="center">
   img src="images/XCF Architecture.png" alt="XCF Layered Architecture" width="500">
