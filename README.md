@@ -22,53 +22,10 @@ A payer scans a QR (or taps NFC), sends the exact PLT amount to the `pay_to` add
 
 ---
 
-## 🧱 Architecture (layered)
+# 🧱 Architecture (layered)
 
 
-```markdown
-# XCF — x402 Concordium Facilitator (UFX + CRP)
-
-**XCF = UFX + CRP**
-- **UFX (Universal Facilitator for x402):** rail-agnostic core that exposes the x402-friendly API, enforces idempotency/expiry, orchestrates policy checks, signs verifiable receipts (JWS), and emits webhooks/metrics.
-- **CRP (Concordium Rail Plugin):** rail-specific adapter that reads **finalized** Concordium PLT (protocol-level token) events via gRPC v2 and matches exact payments.
-
-> **PoC scope:** No custody; no on-chain contracts. Finality-only, exact amount matching, signed receipts, and minimal merchant integration (webhook + polling).
-
----
-
-## ✨ Demo outcome
-A payer scans a QR (or taps NFC), sends the exact PLT amount to the `pay_to` address, and the terminal shows a **green check** as soon as XCF issues a signed receipt.
-
----
-
-## 📐 Hard guarantees
-- **Finality-only:** match only transactions in **last-finalized** blocks (no mempool/pending).
-- **Exact tuple match:** `{ tokenId, to, amountMinor }`, where `amountMinor = toMinorUnits(amount, decimals)`; **no slippage**.
-- **Idempotency:** same `nonce` + identical payload ⇒ same outcome; same `nonce` + different payload ⇒ **422**.
-- **Verifiable receipts:** JWS with `kid`, JWKS published at `/.well-known/jwks.json`.
-- **Auth everywhere:** all facilitator endpoints require auth; CORS allow-list enforced.
-
----
-
-## 🧱 Architecture (layered)
-
-```
-
-Merchant App / Terminal PWA ──► UFX (HTTP API, JWS, webhooks, state)
-│
-├── Plugin Interface & Adapter Boundary
-│
-▼
-CRP (Concordium Rail Plugin)
-│
-▼
-Concordium Node (gRPC v2, finalized)
-
-````
-
----
-
-## 🛣️ API (public, auth required)
+# 🛣️ API (public, auth required)
 
 - `POST /v1/challenges` — register a challenge (idempotent by `nonce`)
 - `POST /v1/verify` — ad-hoc verify inline x402 payloads (no pre-registration)
@@ -85,7 +42,7 @@ Concordium Node (gRPC v2, finalized)
 
 ---
 
-## 📦 Data contracts (canonical)
+# 📦 Data contracts (canonical)
 
 **Challenge**
 
@@ -129,7 +86,7 @@ Concordium Node (gRPC v2, finalized)
 
 ---
 
-## 🔐 Security profile (must-haves)
+# 🔐 Security profile (must-haves)
 
 * **Auth & transport:** HTTPS; auth on all endpoints; CORS allow-list; HSTS; per-route timeouts & rate limits.
 * **Webhooks:** header `X-XCF-Signature` (HMAC-SHA256 over raw body). Base string: `v1:{timestamp}:{sha256(body)}`. Accept ±90s clock skew; merchants dedupe on `{challenge_nonce, tx_hash}`.
@@ -138,13 +95,13 @@ Concordium Node (gRPC v2, finalized)
 
 ---
 
-## ♻️ State machine
+# ♻️ State machine
 
 `pending → fulfilled | expired | invalid | policy_failed` (terminal, immutable; retain ≥ settlement window)
 
 ---
 
-## 🧪 Error taxonomy
+# 🧪 Error taxonomy
 
 * `400` bad request (schema)
 * `401/403` unauthorized/forbidden
@@ -156,7 +113,7 @@ Concordium Node (gRPC v2, finalized)
 
 ---
 
-## 🚀 Replit setup
+# 🚀 Replit setup
 
 1. **Import/Upload** the starter (Node/TS).
 2. **Secrets (Environment):**
@@ -187,7 +144,7 @@ Concordium Node (gRPC v2, finalized)
 
 ---
 
-## 🧩 CRP (Concordium Rail Plugin) notes
+# 🧩 CRP (Concordium Rail Plugin) notes
 
 * **Access:** gRPC v2 to read **last-finalized** blocks. Implement stream with backoff/heartbeat; fallback to polling if needed.
 * **Events:** parse PLT (CIS-7) transfers; resolve `decimals` from a registry/table; cache in memory.
@@ -195,7 +152,7 @@ Concordium Node (gRPC v2, finalized)
 
 ---
 
-## 🧭 Developer workflow (milestones)
+# 🧭 Developer workflow (milestones)
 
 * **M1: UFX API skeleton** — routes, auth, schemas, JWKS, idempotency table.
 * **M2: CRP wiring** — finalized stream/poll, event parsing, matcher unit tests.
@@ -205,7 +162,7 @@ Concordium Node (gRPC v2, finalized)
 
 ---
 
-## 🧰 cURL smoke tests
+# 🧰 cURL smoke tests
 
 ```bash
 # Health & JWKS
@@ -223,7 +180,7 @@ curl -s -H "$AUTH" https://xcf.example.com/v1/challenges/demo-001/status | jq .
 
 ---
 
-## 📁 Repo structure (suggested)
+# 📁 Repo structure (suggested)
 
 ```
 /src
@@ -249,7 +206,7 @@ curl -s -H "$AUTH" https://xcf.example.com/v1/challenges/demo-001/status | jq .
 
 ---
 
-## ✅ Definition of Done (PoC)
+# ✅ Definition of Done (PoC)
 
 * Finality-only matching + strict equality tuple
 * Idempotency semantics enforced (409 vs 422)
@@ -259,13 +216,3 @@ curl -s -H "$AUTH" https://xcf.example.com/v1/challenges/demo-001/status | jq .
 * Demo: terminal gets **green check** on exact payment
 
 ---
-
-## 📜 License
-
-MIT (or your preferred license)
-
-```
-
-If you want, I can tailor the README to your starter repo’s exact file paths and add Ajv JSON schemas under `/schemas` so it’s 100% turnkey.
-::contentReference[oaicite:0]{index=0}
-```
