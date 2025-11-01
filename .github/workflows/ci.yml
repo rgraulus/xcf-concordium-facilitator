@@ -1,5 +1,10 @@
 name: CI
 on: [push, pull_request]
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   schema-check:
     runs-on: ubuntu-latest
@@ -11,3 +16,43 @@ jobs:
       - run: npm ci
       - run: npx ajv compile --spec=draft2020 -c ajv-formats -s schemas/challenge.schema.json
       - run: npx ajv compile --spec=draft2020 -c ajv-formats -s schemas/receipt.schema.json
+
+  sql-migration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pg
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install psql client
+      - name: Install psql client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      # Apply migrations (all .sql in order)
+      - name: Apply migrations
+        env:
+          PGPASSWORD: pg
+        run: |
+          set -e
+          shopt -s nullglob
+          files=(db/migrations/*.sql)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No migration files found, skipping."
+            exit 0
+          fi
+          for f in $(ls db/migrations/*.sql | sort); do
+            echo "Applying $f"
+            psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -f "$f"
+          done
+
