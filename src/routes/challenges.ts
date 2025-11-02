@@ -4,8 +4,32 @@ import { repo, Challenge } from "../store";
 import { compileChallengeValidator } from "../validation/ajv";
 import crypto from "node:crypto";
 
-function stableStringify(v: any): string {
+type ChallengeBody = {
+  network: string;
+  asset: any;
+  amount: string;      // major units as string (e.g., "25.00")
+  pay_to: string;
+  expiry: string;      // ISO 8601
+  nonce?: string;
+  policy?: any;
+  metadata?: any;
+};
+
+
+function normExpiry(v: unknown): number | null {
+  if (v instanceof Date) {
+    return v.getTime();                // DB row via pg → Date
+  }
+  if (typeof v === "string") {
+    const t = Date.parse(v);           // request body → ISO string
+    return Number.isNaN(t) ? null : t;
+  }
+  return null;
+}
+
+function stableStringifyDeep(v: any): string {
   if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(stableStringifyDeep).join(",")}]`;
   const keys = Object.keys(v).sort();
   const o: any = {};
   for (const k of keys) o[k] = v[k];
@@ -13,15 +37,20 @@ function stableStringify(v: any): string {
 }
 
 function samePayload(a: any, b: any): boolean {
-  return (
-    a.network === b.network &&
-    a.amount === b.amount &&
-    a.pay_to === b.pay_to &&
-    a.expiry === b.expiry &&
-    stableStringify(a.asset) === stableStringify(b.asset) &&
-    stableStringify(a.policy ?? null) === stableStringify(b.policy ?? null) &&
-    stableStringify(a.metadata ?? null) === stableStringify(b.metadata ?? null)
-  );
+  // Simple scalars
+  if (String(a.network) !== String(b.network)) return false;
+  if (String(a.amount) !== String(b.amount)) return false;
+  if (String(a.pay_to) !== String(b.pay_to)) return false;
+
+  // Normalize expiry (handles "…Z" vs "…000Z")
+  if (normExpiry(a.expiry) !== normExpiry(b.expiry)) return false;
+
+  // Structured fields
+  if (stableStringifyDeep(a.asset)    !== stableStringifyDeep(b.asset))    return false;
+  if (stableStringifyDeep(a.policy ?? null)   !== stableStringifyDeep(b.policy ?? null))   return false;
+  if (stableStringifyDeep(a.metadata ?? null) !== stableStringifyDeep(b.metadata ?? null)) return false;
+
+  return true;
 }
 
 export async function routes(fastify: FastifyInstance) {
@@ -31,7 +60,7 @@ export async function routes(fastify: FastifyInstance) {
   fastify.post(
     "/v1/challenges",
     async (req: FastifyRequest, reply: FastifyReply) => {
-      const body = req.body as any;
+      const body = req.body as ChallengeBody;
 
       // 1) Validate schema
       const ok = validateChallenge(body);
