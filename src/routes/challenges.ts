@@ -1,146 +1,138 @@
 // src/routes/challenges.ts
-import { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
-import { repo, Challenge } from "../store";
+import { FastifyInstance, FastifyPluginOptions } from "fastify";
+import type { FastifyRequest, FastifyReply } from "fastify";
 import { compileChallengeValidator } from "../validation/ajv";
-import crypto from "node:crypto";
+import { repo } from "../store";
+import type { Challenge, Status } from "../store";
 
-type ChallengeBody = {
-  network: string;
-  asset: any;
-  amount: string;      // major units as string (e.g., "25.00")
-  pay_to: string;
-  expiry: string;      // ISO 8601
-  nonce?: string;
-  policy?: any;
-  metadata?: any;
+// ---- Types for request body (explicit & nullable-friendly) ----
+type Asset = {
+  type: "PLT";
+  tokenId: string;
+  decimals: number;
 };
 
+type ChallengeBody = {
+  nonce: string;
+  network: string; // e.g., "concordium:testnet"
+  asset: Asset;
+  amount: string;  // "25.00" (major units)
+  pay_to: string;  // recipient address
+  expiry: string;  // ISO date-time
+  policy?: Record<string, unknown> | null;   // nullable input allowed
+  metadata?: Record<string, unknown> | null; // nullable input allowed
+};
 
-function normExpiry(v: unknown): number | null {
-  if (v instanceof Date) {
-    return v.getTime();                // DB row via pg → Date
-  }
-  if (typeof v === "string") {
-    const t = Date.parse(v);           // request body → ISO string
-    return Number.isNaN(t) ? null : t;
-  }
-  return null;
-}
+const validateChallenge = compileChallengeValidator();
 
-function stableStringifyDeep(v: any): string {
-  if (v === null || typeof v !== "object") return JSON.stringify(v);
-  if (Array.isArray(v)) return `[${v.map(stableStringifyDeep).join(",")}]`;
-  const keys = Object.keys(v).sort();
-  const o: any = {};
-  for (const k of keys) o[k] = v[k];
-  return JSON.stringify(o);
-}
-
-function samePayload(a: any, b: any): boolean {
-  // Simple scalars
-  if (String(a.network) !== String(b.network)) return false;
-  if (String(a.amount) !== String(b.amount)) return false;
-  if (String(a.pay_to) !== String(b.pay_to)) return false;
-
-  // Normalize expiry (handles "…Z" vs "…000Z")
-  if (normExpiry(a.expiry) !== normExpiry(b.expiry)) return false;
-
-  // Structured fields
-  if (stableStringifyDeep(a.asset)    !== stableStringifyDeep(b.asset))    return false;
-  if (stableStringifyDeep(a.policy ?? null)   !== stableStringifyDeep(b.policy ?? null))   return false;
-  if (stableStringifyDeep(a.metadata ?? null) !== stableStringifyDeep(b.metadata ?? null)) return false;
-
-  return true;
-}
-
-export async function routes(fastify: FastifyInstance) {
-  const validateChallenge = compileChallengeValidator(); // Ajv compiled fn
-
-  // POST /v1/challenges  — create/register challenge (idempotent on merchant_id+nonce)
-  fastify.post(
+export function routes(app: FastifyInstance, _opts: FastifyPluginOptions, done: () => void) {
+  // POST /v1/challenges  — upsert with idempotency (nonce scoped per merchant)
+  app.post(
     "/v1/challenges",
-    async (req: FastifyRequest, reply: FastifyReply) => {
-      const body = req.body as ChallengeBody;
-
-      // 1) Validate schema
-      const ok = validateChallenge(body);
-      if (!ok) {
-        return reply.status(400).send({
-          error: "invalid_request",
-          details: validateChallenge.errors,
-        });
-      }
-
-      // 2) Merchant ID from header (adjust if you carry it differently)
-      const merchant_id =
-        (req.headers["x-merchant-id"] as string) ??
-        (req.headers["x-merchant"] as string);
+    async (request: FastifyRequest<{ Body: ChallengeBody }>, reply: FastifyReply) => {
+      const merchant_id = String(request.headers["x-merchant-id"] || "").trim();
       if (!merchant_id) {
-        return reply.status(401).send({ error: "missing_merchant_id" });
+        return reply.code(400).send({ error: "missing_header", message: "X-Merchant-Id header is required." });
       }
 
-      // 3) Canonicalize input
-      const incoming: Challenge = {
+      const body = request.body;
+
+      // Validate against JSON Schema (Ajv)
+      const valid = validateChallenge(body as unknown as Record<string, unknown>);
+      if (!valid) {
+        return reply.code(400).send({ error: "invalid_body", details: validateChallenge.errors || [] });
+      }
+
+      // Coerce nullable policy/metadata to plain objects (match repo types)
+      const {
+        nonce,
+        network,
+        asset,
+        amount,
+        pay_to,
+        expiry,
+        policy = null,
+        metadata = null,
+      } = body;
+
+      const policyObj = (policy ?? {}) as Record<string, any>;
+      const metadataObj = (metadata ?? {}) as Record<string, any>;
+
+      // Payload persisted & compared for idempotency
+      const payload: Omit<Challenge,
+        "status" | "receipt" | "created_at" | "updated_at"> & { status?: Status } = {
         merchant_id,
-        nonce: body.nonce || crypto.randomUUID(),
-        network: body.network,
-        asset: body.asset,
-        amount: body.amount,
-        pay_to: body.pay_to,
-        expiry: body.expiry,
-        policy: body.policy,
-        metadata: body.metadata,
+        nonce,
+        network,
+        asset,
+        amount,
+        pay_to,
+        expiry,
+        policy: policyObj,
+        metadata: metadataObj,
+        status: "pending",
       };
 
-      // 4) Idempotency check
-      const existing = await repo.getChallenge(incoming.merchant_id, incoming.nonce);
-      if (existing) {
-        if (samePayload(existing, incoming)) {
-          // identical -> idempotent OK
-          return reply.status(200).send({
-            nonce: existing.nonce,
-            status: existing.status,
-            challenge: existing,
-          });
-        }
-        // conflicting -> 409
-        return reply.status(409).send({
-          error: "conflict",
-          message:
-            "Challenge with the same (merchant_id, nonce) exists with different payload.",
-        });
-      }
+      // Helpful debug line while we’re iterating locally
+      app.log.info({ merchantId: merchant_id, receivedBody: body }, "DEBUG incoming challenge");
 
-      // 5) First insert (status defaults to 'pending' in DB)
-      const saved = await repo.upsertChallenge(incoming);
-      return reply.status(201).send({
-        nonce: saved.nonce,
-        status: saved.status,
-        challenge: saved,
-      });
+      // Upsert with idempotency
+      const result = await repo.upsertChallenge(payload);
+
+      // Read back the row so we can echo the canonical DB view
+      const saved = await repo.getChallenge(merchant_id, nonce);
+
+      // Fallback to payload if (unexpectedly) not found
+      const challenge = saved ?? {
+        merchant_id,
+        nonce,
+        network,
+        asset,
+        amount,
+        pay_to,
+        expiry,
+        policy: policyObj,
+        metadata: metadataObj,
+        status: "pending" as const,
+      };
+
+      if (result.created) {
+        return reply.code(201).send({ nonce, status: "pending", challenge });
+      }
+      if (result.samePayload) {
+        return reply.code(200).send({ nonce, status: "pending", challenge });
+      }
+      return reply
+        .code(409)
+        .send({ error: "conflict", message: "Challenge with the same (merchant_id, nonce) exists with different payload." });
     }
   );
 
-  // GET /v1/challenges/:nonce/status  — poll challenge status
-  fastify.get(
+  // GET /v1/challenges/:nonce/status — read current status
+  app.get(
     "/v1/challenges/:nonce/status",
-    async (req: FastifyRequest, reply: FastifyReply) => {
-      const merchant_id =
-        (req.headers["x-merchant-id"] as string) ??
-        (req.headers["x-merchant"] as string);
+    async (
+      request: FastifyRequest<{ Params: { nonce: string } }>,
+      reply: FastifyReply
+    ) => {
+      const merchant_id = String(request.headers["x-merchant-id"] || "").trim();
       if (!merchant_id) {
-        return reply.status(401).send({ error: "missing_merchant_id" });
+        return reply.code(400).send({ error: "missing_header", message: "X-Merchant-Id header is required." });
       }
 
-      const { nonce } = req.params as { nonce: string };
+      const { nonce } = request.params;
       const row = await repo.getChallenge(merchant_id, nonce);
-      if (!row) return reply.status(404).send({ error: "not_found" });
+      if (!row) return reply.code(404).send({ error: "not_found" });
 
-      return reply.send({
-        nonce: row.nonce,
+      return reply.code(200).send({
+        nonce,
         status: row.status,
         challenge: row,
       });
     }
   );
+
+  done();
 }
+
+export default routes;
