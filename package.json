@@ -11,7 +11,8 @@
     "schema:check": "ajv compile --spec=draft2020 -c ajv-formats -s schemas/challenge.schema.json && ajv compile --spec=draft2020 -c ajv-formats -s schemas/receipt.schema.json",
     "dev": "ts-node src/server.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "smoke:idempotency": "bash scripts/smoke-idempotency.sh"
   },
   "repository": {
     "type": "git",
@@ -35,6 +36,7 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
+    "dotenv": "^17.2.3",
     "fastify": "^5.6.1",
     "fastify-plugin": "^5.1.0",
     "jose": "^6.1.0",
