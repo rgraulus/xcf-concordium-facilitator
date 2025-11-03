@@ -1,6 +1,7 @@
 // src/store/repo.pg.ts
 import { pool } from "../db/pool";
 
+<<<<<<< Updated upstream
 /** ---------- Types ---------- */
 
 export type Status = "pending" | "fulfilled" | "expired" | "invalid" | "policy_failed";
@@ -42,6 +43,40 @@ export type ChallengeInsert = Omit<
 
 /** Convert DB row → Challenge (ensures types/ISO strings) */
 function mapRow(row: any): Challenge {
+=======
+/** Types */
+export type Status =
+  | "pending"
+  | "fulfilled"
+  | "expired"
+  | "invalid"
+  | "policy_failed";
+
+export type Asset = {
+  type: string;     // e.g. "PLT"
+  tokenId: string;  // e.g. "usd:test"
+  decimals: number; // e.g. 2
+};
+
+export type Challenge = {
+  merchant_id: string;
+  nonce: string;
+  network: string;                // e.g. "concordium:testnet"
+  asset: Asset;
+  amount: string;                 // major units string
+  pay_to: string;                 // recipient address
+  expiry: string;                 // ISO string
+  policy: Record<string, any>;    // stored as JSONB
+  metadata: Record<string, any>;  // stored as JSONB
+  status: Status;
+  receipt: Record<string, any> | null;
+  created_at: string;             // ISO serialized from DB
+  updated_at: string;             // ISO serialized from DB
+};
+
+/** Row → domain mapper (normalizes dates & nulls) */
+function toChallengeRow(row: any): Challenge {
+>>>>>>> Stashed changes
   return {
     merchant_id: row.merchant_id,
     nonce: row.nonce,
@@ -50,13 +85,19 @@ function mapRow(row: any): Challenge {
     amount: row.amount,
     pay_to: row.pay_to,
     expiry: new Date(row.expiry).toISOString(),
+<<<<<<< Updated upstream
     policy: row.policy ?? null,
     metadata: row.metadata ?? null,
+=======
+    policy: row.policy ?? {},
+    metadata: row.metadata ?? {},
+>>>>>>> Stashed changes
     status: row.status,
     receipt: row.receipt ?? null,
     created_at: new Date(row.created_at).toISOString(),
     updated_at: new Date(row.updated_at).toISOString(),
   };
+<<<<<<< Updated upstream
 }
 
 /** ---------- Reads ---------- */
@@ -287,4 +328,170 @@ export async function setStatus(
     [merchantId, nonce, status]
   );
   return (r.rowCount ?? 0) === 1;
+=======
 }
+
+/**
+ * Idempotent upsert:
+ * - Insert on first seen ({created:true, samePayload:false, row})
+ * - If exists with identical payload → no-op ({created:false, samePayload:true, row})
+ * - If exists but payload differs → conflict ({created:false, samePayload:false})
+ */
+export async function upsertChallenge(
+  input: Omit<Challenge, "status" | "receipt" | "created_at" | "updated_at"> & {
+    status?: Status;
+  }
+): Promise<
+  | { created: true; samePayload: false; row: Challenge }
+  | { created: false; samePayload: true; row: Challenge }
+  | { created: false; samePayload: false }
+> {
+  const {
+    merchant_id,
+    nonce,
+    network,
+    asset,
+    amount,
+    pay_to,
+    expiry,
+    policy = {},
+    metadata = {},
+    status = "pending",
+  } = input;
+
+  // Normalize & validate expiry
+  const expiryIso = new Date(expiry).toISOString();
+  if (Number.isNaN(Date.parse(expiryIso))) {
+    throw new Error("Invalid expiry");
+  }
+
+  // 1) Try insert (let unique constraint guard idempotency)
+  const ins = await pool.query(
+    `
+    INSERT INTO challenges (
+      merchant_id, nonce, network, asset, amount, pay_to, expiry,
+      policy, metadata, status
+    ) VALUES (
+      $1, $2, $3, $4::jsonb, $5, $6, $7, $8::jsonb, $9::jsonb, $10
+    )
+    ON CONFLICT (merchant_id, nonce) DO NOTHING
+    RETURNING *;
+    `,
+    [
+      merchant_id,
+      nonce,
+      network,
+      asset,        // object; cast to jsonb in SQL
+      amount,
+      pay_to,
+      expiryIso,
+      policy ?? {}, // object; cast to jsonb in SQL
+      metadata ?? {}, // object; cast to jsonb in SQL
+      status,
+    ]
+  );
+
+  if ((ins.rowCount ?? 0) > 0) {
+    return { created: true, samePayload: false, row: toChallengeRow(ins.rows[0]) };
+  }
+
+  // 2) Already exists → fetch & compare payloads
+  const sel = await pool.query(
+    `SELECT * FROM challenges WHERE merchant_id = $1 AND nonce = $2;`,
+    [merchant_id, nonce]
+  );
+
+  if ((sel.rowCount ?? 0) > 0) {
+    const row = sel.rows[0];
+    const same =
+      row.network === network &&
+      JSON.stringify(row.asset) === JSON.stringify(asset) &&
+      row.amount === amount &&
+      row.pay_to === pay_to &&
+      new Date(row.expiry).toISOString() === expiryIso &&
+      JSON.stringify(row.policy ?? {}) === JSON.stringify(policy ?? {}) &&
+      JSON.stringify(row.metadata ?? {}) === JSON.stringify(metadata ?? {});
+
+    if (same) {
+      return { created: false, samePayload: true, row: toChallengeRow(row) };
+    }
+  }
+
+  // 3) Exists but differs → conflict
+  return { created: false, samePayload: false };
+}
+
+/** Read current status + full challenge */
+export async function getStatus(
+  merchantId: string,
+  nonce: string
+): Promise<Challenge | null> {
+  const { rows } = await pool.query(
+    `SELECT * FROM challenges WHERE merchant_id = $1 AND nonce = $2;`,
+    [merchantId, nonce]
+  );
+  return rows[0] ? toChallengeRow(rows[0]) : null;
+}
+
+/** Alias kept for older imports (no harm if unused) */
+export async function getChallenge(
+  merchantId: string,
+  nonce: string
+): Promise<Challenge | null> {
+  return getStatus(merchantId, nonce);
+>>>>>>> Stashed changes
+}
+
+/**
+ * Mark as fulfilled + attach receipt (payload + jws)
+ * 4-argument signature:
+ *   (merchantId, nonce, receiptPayloadObject, jwsString)
+ * Also persists to receipts table (idempotent upsert).
+ */
+export async function markFulfilled(
+  merchant_id: string,
+  nonce: string,
+  receipt: any,
+  jws: string
+): Promise<Challenge | null> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const upd = await client.query<Challenge>(
+      `
+      UPDATE challenges
+         SET status = 'fulfilled',
+             receipt = jsonb_build_object('jws', $4::text, 'payload', $3::jsonb),
+             updated_at = now()
+       WHERE merchant_id = $1 AND nonce = $2
+       RETURNING *;
+      `,
+      [merchant_id, nonce, JSON.stringify(receipt ?? {}), jws]
+    );
+
+    if ((upd.rowCount ?? 0) === 0) {
+      await client.query("ROLLBACK");
+      return null;
+    }
+
+    await client.query(
+      `
+      INSERT INTO receipts (merchant_id, nonce, jws)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (merchant_id, nonce)
+      DO UPDATE SET jws = EXCLUDED.jws;
+      `,
+      [merchant_id, nonce, jws]
+    );
+
+    await client.query("COMMIT");
+    return upd.rows[0];
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+

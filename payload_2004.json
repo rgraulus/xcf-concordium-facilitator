@@ -1,0 +1,10 @@
+{
+  "nonce": "n-2004",
+  "network": "concordium:testnet",
+  "asset": { "type": "PLT", "tokenId": "usd:test", "decimals": 2 },
+  "amount": "25.00",
+  "pay_to": "ccd1qexampleaddress",
+  "expiry": "2025-11-02T12:00:00Z",
+  "policy": {},
+  "metadata": {}
+}
