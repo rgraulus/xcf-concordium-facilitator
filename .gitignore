@@ -5,3 +5,7 @@ node_modules/
 
 # local smoke payloads
 payload*.json
+
+# local smoke payloads
+/tmp/payload*.json
+/tmp/fulfill.json

@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# Generate a fresh nonce each run to avoid DB conflicts
 NONCE="n-$(date +%s)"
-
-# Build a payload in a temp file
-PAYLOAD="$(mktemp 2>/dev/null || echo ./payload.$$)"
-cat > "$PAYLOAD" <<JSON
+cat > /tmp/payload_ok.json <<JSON
 {
   "nonce": "$NONCE",
   "network": "concordium:testnet",
@@ -19,36 +14,48 @@ cat > "$PAYLOAD" <<JSON
 }
 JSON
 
-echo "Using nonce: $NONCE"
-echo
-echo "A) Create (expect 201)"
-curl -i -X POST http://localhost:8080/v1/challenges \
+echo "Using NONCE: $NONCE"
+
+# 201 then 200
+curl -s -o /dev/null -w "create %{http_code}\n" \
+  -X POST http://localhost:8080/v1/challenges \
+  -H "Content-Type: application/json" -H "X-Merchant-Id: demo-merchant" \
+  --data-binary @/tmp/payload_ok.json
+curl -s -o /dev/null -w "idem %{http_code}\n" \
+  -X POST http://localhost:8080/v1/challenges \
+  -H "Content-Type: application/json" -H "X-Merchant-Id: demo-merchant" \
+  --data-binary @/tmp/payload_ok.json
+
+# 409
+sed 's/"25.00"/"30.00"/' /tmp/payload_ok.json > /tmp/payload_bad.json
+curl -s -o /dev/null -w "conflict %{http_code}\n" \
+  -X POST http://localhost:8080/v1/challenges \
+  -H "Content-Type: application/json" -H "X-Merchant-Id: demo-merchant" \
+  --data-binary @/tmp/payload_bad.json
+
+# fulfill -> /tmp/fulfill.json
+curl -s -X POST http://localhost:8080/v1/admin/fulfill \
   -H "Content-Type: application/json" \
-  -H "X-Merchant-Id: demo-merchant" \
-  --data-binary @"$PAYLOAD" | sed -n '1,10p'
+  --data-binary @- <<JSON > /tmp/fulfill.json
+{
+  "merchant_id": "demo-merchant",
+  "nonce": "$NONCE",
+  "receipt": {
+    "nonce": "$NONCE",
+    "amount": "25.00",
+    "network": "concordium:testnet",
+    "asset": { "type": "PLT", "tokenId": "usd:test", "decimals": 2 },
+    "paidTo": "ccd1qexampleaddress",
+    "finalizedAt": "$(date -u +%FT%TZ)"
+  }
+}
+JSON
 
-echo
-echo "B) Re-POST same payload (expect 200)"
-curl -i -X POST http://localhost:8080/v1/challenges \
+# extract JWS without jq
+JWS=$(awk -v RS= -v ORS= 'match($0, /"jws":"([^"]+)"/, m) { print m[1] }' /tmp/fulfill.json)
+echo "jws_len $(printf %s "$JWS" | wc -c)"
+
+# verify
+curl -s -X POST http://localhost:8080/v1/verify \
   -H "Content-Type: application/json" \
-  -H "X-Merchant-Id: demo-merchant" \
-  --data-binary @"$PAYLOAD" | sed -n '1,10p'
-
-# Make a conflicting copy (change amount)
-PAYLOAD_CONFLICT="$(mktemp 2>/dev/null || echo ./payload_conflict.$$)"
-sed 's/"25.00"/"30.00"/' "$PAYLOAD" > "$PAYLOAD_CONFLICT"
-
-echo
-echo "C) Same nonce, different payload (expect 409)"
-curl -i -X POST http://localhost:8080/v1/challenges \
-  -H "Content-Type: application/json" \
-  -H "X-Merchant-Id: demo-merchant" \
-  --data-binary @"$PAYLOAD_CONFLICT" | sed -n '1,10p'
-
-echo
-echo "D) Status probe (expect JSON with status=pending)"
-curl -s "http://localhost:8080/v1/challenges/$NONCE/status" \
-  -H "X-Merchant-Id: demo-merchant" | sed -n '1,5p'
-
-# Cleanup temp files
-rm -f "$PAYLOAD" "$PAYLOAD_CONFLICT" || true
+  --data "{\"jws\":\"$JWS\"}" | tr -d '\n'; echo
