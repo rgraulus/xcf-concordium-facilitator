@@ -19,7 +19,6 @@ function normalizeObj<T extends object | null | undefined>(v: T): Record<string,
 }
 
 function toIso(s: string): string {
-  // normalize any ISO-ish input to canonical ISO string
   return new Date(s).toISOString();
 }
 
@@ -37,19 +36,12 @@ export async function routes(app: FastifyInstance) {
       }
 
       const b = request.body;
-
-      // Basic payload validation surface (AJV handles schema in CI; this is runtime guardrails)
       if (!b || !b.nonce || !b.network || !b.asset || !b.amount || !b.pay_to || !b.expiry) {
         return reply.code(400).send({ error: "invalid_body", message: "Missing required fields" });
       }
 
-      // Helpful debug log (you used this earlier)
-      app.log.info(
-        { merchantId: merchant_id, receivedBody: b },
-        "DEBUG incoming challenge"
-      );
+      app.log.info({ merchantId: merchant_id, receivedBody: b }, "DEBUG incoming challenge");
 
-      // Assemble canonical payload for the DB/upsert (status defaults to 'pending')
       const payload: Omit<Challenge, "status" | "receipt" | "created_at" | "updated_at"> & {
         status?: Status;
       } = {
@@ -65,41 +57,34 @@ export async function routes(app: FastifyInstance) {
         status: "pending",
       };
 
-      // Perform idempotent upsert
       const result = await repo.upsertChallenge(payload);
 
-      if (result.created) {
-        // 201 Created on first insert
-        const challenge = result.row;
-        return reply.code(201).send({
-          nonce: challenge.nonce,
-          status: challenge.status,
-          challenge,
-        });
-      }
-
-      if (result.samePayload) {
-        // 200 on exact same payload (idempotent)
-        const latest = await repo.getStatus(merchant_id, b.nonce);
-        if (!latest) {
-          // defensive: should exist, but handle gracefully
-          return reply.code(404).send({ error: "not_found" });
+      // Narrow the union by checking 'row' existence
+      if ("row" in result && result.row) {
+        const ch = result.row;
+        if (result.created) {
+          // First insert → 201
+          return reply.code(201).send({
+            nonce: ch.nonce,
+            status: ch.status,
+            challenge: ch,
+          });
         }
-        return reply.code(200).send({
-          nonce: latest.nonce,
-          status: latest.status,
-          challenge: latest,
-        });
+        if (result.samePayload) {
+          // Idempotent re-post → 200
+          return reply.code(200).send({
+            nonce: ch.nonce,
+            status: ch.status,
+            challenge: ch,
+          });
+        }
       }
 
-      // Otherwise, conflict (same (merchant_id, nonce) but different payload)
-      return reply
-        .code(409)
-        .send({
-          error: "conflict",
-          message:
-            "Challenge with the same (merchant_id, nonce) exists with different payload.",
-        });
+      // Otherwise: existing row differs → 409
+      return reply.code(409).send({
+        error: "conflict",
+        message: "Challenge with the same (merchant_id, nonce) exists with different payload.",
+      });
     }
   );
 
@@ -116,7 +101,8 @@ export async function routes(app: FastifyInstance) {
       }
 
       const { nonce } = request.params;
-      const row = await repo.getStatus(merchant_id, nonce);
+      // Use the repo helper you already have; if it’s named differently, adjust here.
+      const row = await repo.getStatus?.(merchant_id, nonce);
       if (!row) {
         return reply.code(404).send({ error: "not_found" });
       }
