@@ -36,6 +36,8 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
+    "@concordium/node-sdk": "^9.5.3",
+    "@grpc/grpc-js": "^1.14.0",
     "dotenv": "^17.2.3",
     "fastify": "^5.6.1",
     "fastify-plugin": "^5.1.0",
