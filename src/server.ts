@@ -31,6 +31,13 @@ if (typeof crpHealthPlugin === "function") {
   );
 }
 
+// Print routes after all plugins are ready (optional; set PRINT_ROUTES=1 to enable)
+app.ready().then(() => {
+  if (process.env.PRINT_ROUTES === "1") {
+    app.log.info("\n" + app.printRoutes());
+  }
+});
+
 // Start server
 const port = Number(process.env.PORT || 8080);
 app
