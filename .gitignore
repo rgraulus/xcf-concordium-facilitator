@@ -12,3 +12,6 @@ payload*.json
 
 # local smoke payloads in repo root
 payload*.json
+
+# build output
+dist/
