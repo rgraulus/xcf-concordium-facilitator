@@ -10,10 +10,12 @@
     "test": "jest -i",
     "test:ci": "jest --ci --runInBand",
     "schema:check": "ajv compile --spec=draft2020 -c ajv-formats -s schemas/challenge.schema.json && ajv compile --spec=draft2020 -c ajv-formats -s schemas/receipt.schema.json",
-    "dev": "ts-node src/server.ts",
-    "build": "tsc -p tsconfig.json",
+    "dev": "npm run build && node dist/server.js",
+    "build": "tsc -p tsconfig.json && npm run postbuild:copy-schemas",
+    "postbuild:copy-schemas": "node -e \"const fs=require('fs');try{fs.cpSync('schemas','dist/schemas',{recursive:true});console.log('Copied schemas/ -> dist/schemas');}catch(e){if(e.code!=='ENOENT') throw e;}\"",
     "start": "node dist/server.js",
     "smoke:idempotency": "bash scripts/smoke-idempotency.sh",
+    "smoke:crp": "bash scripts/smoke-crp-reads.sh",
     "health": "curl -s http://localhost:8080/v1/crp/health | python -m json.tool"
   },
   "repository": {
@@ -41,12 +43,15 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@concordium/node-sdk": "^9.5.3",
+    "@concordium/node-sdk": "9.4.0",
     "@grpc/grpc-js": "^1.14.0",
     "dotenv": "^17.2.3",
     "fastify": "^5.6.1",
     "fastify-plugin": "^5.1.0",
     "jose": "^6.1.0",
     "pg": "^8.16.3"
+  },
+  "overrides": {
+    "@concordium/node-sdk": "9.4.0"
   }
 }
