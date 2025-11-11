@@ -2,49 +2,34 @@
 import Fastify from "fastify";
 import dotenv from "dotenv";
 
-dotenv.config(); // load .env for JWS keys, DB, GRPC, etc.
+dotenv.config(); // load .env for JWS keys, etc.
 
 import { routes as challengeRoutes } from "./routes/challenges";
 import { routes as jwksRoutes } from "./routes/jwks";
 import { routes as verifyRoutes } from "./routes/verify";
 import { routes as adminRoutes } from "./routes/admin";
-
-// Robust imports that support default export, named `routes`, or module-as-plugin
-import * as crpHealth from "./routes/crp.health";
-import * as crpReads from "./routes/crp.reads";
+import crpHealthRoutes from "./routes/crp.health";
+import { routes as crpReadsRoutes } from "./routes/crp.reads";      // <-- named import
+import { routes as crpPaymentsRoutes } from "./routes/crp.payments"; // <-- named import
 
 const app = Fastify({ logger: true });
+
+// Optional: print mounted routes at boot if PRINT_ROUTES=1
+if (process.env.PRINT_ROUTES === "1") {
+  app.addHook("onReady", async () => {
+    // @ts-ignore
+    app.log.info("\n" + app.printRoutes());
+  });
+}
 
 // Register routes (once each)
 app.register(challengeRoutes);
 app.register(jwksRoutes);
 app.register(verifyRoutes);
 app.register(adminRoutes);
-
-// Resolve plugins from whatever the modules export
-const crpHealthPlugin =
-  (crpHealth as any).default ?? (crpHealth as any).routes ?? (crpHealth as any);
-const crpReadsPlugin =
-  (crpReads as any).default ?? (crpReads as any).routes ?? (crpReads as any);
-
-if (typeof crpHealthPlugin === "function") {
-  app.register(crpHealthPlugin);
-} else {
-  app.log.warn("crp.health did not export a Fastify plugin (default or `routes`). Skipping.");
-}
-
-if (typeof crpReadsPlugin === "function") {
-  app.register(crpReadsPlugin);
-} else {
-  app.log.warn("crp.reads did not export a Fastify plugin (default or `routes`). Skipping.");
-}
-
-// Optional: print the mounted route tree on boot
-app.ready().then(() => {
-  if (process.env.PRINT_ROUTES === "1") {
-    app.log.info("\n" + app.printRoutes());
-  }
-});
+app.register(crpHealthRoutes);
+app.register(crpReadsRoutes);
+app.register(crpPaymentsRoutes);
 
 // Start server
 const port = Number(process.env.PORT || 8080);
@@ -55,3 +40,5 @@ app
     app.log.error(err);
     process.exit(1);
   });
+
+export default app;

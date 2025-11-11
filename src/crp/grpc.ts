@@ -127,3 +127,39 @@ export async function getAccountInfo(accountAddress: string) {
   const c = await getConcordiumClient();
   return c.getAccountInfo(accountAddress);
 }
+
+/* ---------- Step 3: PLT payment search (scaffold) ---------- */
+
+export type PltSearchFilters = {
+  tokenId?: string;           // e.g., "usd:test"
+  to?: string;                // account address (ccd...)
+  min?: string;               // minimum amount as string of base units
+  fromHeight?: string;        // optional starting height (string to avoid BigInt)
+  limit?: number;             // cap matches returned
+};
+
+export type PltMatch = {
+  hash: string;               // tx hash
+  index: number;              // event index in tx
+  tokenId: string;
+  amount: string;             // stringified
+  from?: string;
+  to?: string;
+  finalizedAt?: string;       // ISO
+  blockHash?: string;
+  blockHeight?: string;
+};
+
+/**
+ * TEMPORARY STUB: returns an empty array but preserves the final shape.
+ * This lets us wire the route + smoke now, then implement the SDK traversal next.
+ *
+ * TODO (replace body):
+ *  - walk finalized blocks (from head or fromHeight)
+ *  - for each tx -> events, normalize PLT transfers
+ *  - apply filters (tokenId, to, min), push until limit
+ */
+export async function searchPltPayments(filters: PltSearchFilters): Promise<PltMatch[]> {
+  void filters; // silence unused warning for now
+  return [];
+}

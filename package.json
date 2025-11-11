@@ -16,6 +16,7 @@
     "start": "node dist/server.js",
     "smoke:idempotency": "bash scripts/smoke-idempotency.sh",
     "smoke:crp": "bash scripts/smoke-crp-reads.sh",
+    "smoke:plt": "bash scripts/smoke-crp-plt.sh",
     "health": "curl -s http://localhost:8080/v1/crp/health | python -m json.tool"
   },
   "repository": {
