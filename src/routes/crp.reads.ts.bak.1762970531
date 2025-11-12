@@ -1,0 +1,51 @@
+// src/routes/crp.reads.ts
+import type { FastifyInstance } from "fastify";
+import { getQueries } from "../crp/grpc";
+
+/** hex helper for Uint8Array or Buffer */
+function toHex(u8?: Uint8Array | Buffer | null): string {
+  if (!u8) return "";
+  // Node buffers stringify fine; ensure Uint8Array gets converted
+  const buf = Buffer.isBuffer(u8) ? u8 : Buffer.from(u8);
+  return buf.toString("hex");
+}
+
+/** ultra-simple address sanity (we only demo 400 vs 200 shape) */
+function isProbablyAccountAddress(addr: string): boolean {
+  return typeof addr === "string" && addr.startsWith("ccd1") && addr.length >= 20;
+}
+
+export default async function routes(server: FastifyInstance) {
+  // GET /v1/crp/consensus
+  server.get("/consensus", async (_req, _reply) => {
+    const queries = getQueries();
+    // v2.Queries.GetConsensusInfo expects an empty object {}
+    const info = await queries.getConsensusInfo({}, {});
+    // We only expose what we need (BigInt-safe)
+    const bestHashHex = toHex(info.bestBlock ?? null);
+    const finalizedHashHex = toHex(info.lastFinalizedBlock ?? null);
+
+    return {
+      ok: true,
+      consensus: { genesisIndex: info.genesisIndex ?? null },
+      blocks: {
+        best: { hash: bestHashHex, height: "" },          // height left intentionally empty in M2
+        finalized: { hash: finalizedHashHex, height: "" } // height left intentionally empty in M2
+      },
+      network: "testnet",
+    };
+  });
+
+  // GET /v1/crp/account/:address (kept minimal; returns 400 for invalid)
+  server.get<{
+    Params: { address: string }
+  }>("/account/:address", async (req, reply) => {
+    const { address } = req.params;
+    if (!isProbablyAccountAddress(address)) {
+      reply.code(400);
+      return { error: "INVALID_ADDRESS" };
+    }
+    // For M2 we’re not doing a full account read. Keep 200 with a stub payload.
+    return { ok: true, address };
+  });
+}

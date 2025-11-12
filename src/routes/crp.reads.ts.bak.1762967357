@@ -1,0 +1,54 @@
+import type { FastifyInstance } from "fastify";
+import { getQueries } from "../crp/grpc";
+
+/** Robustly turn a protobuf BlockHash into hex */
+function hashToHex(h: any): string {
+  if (!h) return "";
+  // common protobuf-ts shapes: { value: Uint8Array } or raw Uint8Array
+  const v = (h && typeof h === "object" && "value" in h) ? (h as any).value : h;
+
+  if (typeof v === "string") return v;                // already a string
+  if (v instanceof Uint8Array) return Buffer.from(v).toString("hex");
+  if (Array.isArray(v)) return Buffer.from(Uint8Array.from(v)).toString("hex");
+
+  // last resort
+  try { return Buffer.from(v as any).toString("hex"); } catch { return String(v); }
+}
+
+/** Very light validation: CCD addresses start with 'ccd1' and are bech32-ish. */
+export function validateAccountAddress(addr: string): boolean {
+  return typeof addr === "string" && addr.length >= 10 && addr.startsWith("ccd1");
+}
+
+export default async function routes(server: FastifyInstance) {
+  // GET /v1/crp/consensus — return hex hashes, avoid BigInt serialization
+  server.get("/v1/crp/consensus", async (_req, _reply) => {
+    const q = getQueries();
+    const info: any = await q.getConsensusStatus();
+
+    const bestHex = hashToHex(info?.bestBlock);
+    const finHex  = hashToHex(info?.lastFinalizedBlock);
+
+    return {
+      ok: true,
+      consensus: {
+        genesisIndex: info?.genesisIndex ?? null,
+      },
+      blocks: {
+        best:      { hash: bestHex, height: "" },      // we omit heights to avoid BigInt
+        finalized: { hash: finHex,  height: "" },
+      },
+      network: "testnet",
+    };
+  });
+
+  // GET /v1/crp/account/:address — simple parameter validation passthrough
+  server.get("/v1/crp/account/:address", async (req, reply) => {
+    const { address } = (req.params as { address: string });
+    if (!validateAccountAddress(address)) {
+      return reply.code(400).send({ error: "Invalid account address" });
+    }
+    // If you want to expand later: resolve account info here.
+    return reply.send({ ok: true }); // placeholder to keep the route healthy
+  });
+}
