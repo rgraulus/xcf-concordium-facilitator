@@ -1,4 +1,6 @@
-// src/server.ts (clean drop-in)
+cp src/server.ts src/server.ts.bak.$(date +%s)
+cat > src/server.ts <<'TS'
+// src/server.ts
 import "dotenv/config";
 import Fastify, { FastifyInstance, FastifyPluginCallback } from "fastify";
 
@@ -12,7 +14,7 @@ import * as crpReadsMod from "./routes/crp.reads";
 import * as crpPaymentsMod from "./routes/crp.payments";
 import * as crpHealthMod from "./routes/crp.health";
 
-// --- Small helper to register either default export or the module itself ---
+// --- Helper to register either default export or a named function (routes) ---
 function asPlugin(mod: any): FastifyPluginCallback {
   if (mod && typeof mod.default === "function") return mod.default as FastifyPluginCallback;
   if (typeof mod === "function") return mod as FastifyPluginCallback;
@@ -36,11 +38,11 @@ export async function buildServer(): Promise<FastifyInstance> {
   server.register(asPlugin(challengesMod));
 
   // --- CRP routes with prefix /v1/crp ---
-  server.register(asPlugin(crpHealthMod), { prefix: "/v1/crp" });
-  server.register(asPlugin(crpReadsMod), { prefix: "/v1/crp" });
+  server.register(asPlugin(crpHealthMod),   { prefix: "/v1/crp" });
+  server.register(asPlugin(crpReadsMod),    { prefix: "/v1/crp" });
   server.register(asPlugin(crpPaymentsMod), { prefix: "/v1/crp" });
 
-  // Not found handler (keeps default Fastify 404 body but ensures logging)
+  // 404 with log
   server.setNotFoundHandler((req, reply) => {
     req.log.info({ url: req.raw.url, method: req.raw.method }, "Route not found");
     reply.code(404).send({ message: `Route ${req.method}:${req.url} not found`, error: "Not Found", statusCode: 404 });
@@ -57,7 +59,6 @@ async function start() {
 
     await server.listen({ host, port });
 
-    // Convenience log lines to mirror what you’ve been seeing
     const addrs = server.addresses();
     if (Array.isArray(addrs)) {
       for (const addr of addrs) {
@@ -71,7 +72,6 @@ async function start() {
   }
 }
 
-// Run only if executed directly
 if (require.main === module) {
   start();
 }

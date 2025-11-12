@@ -1,0 +1,124 @@
+// src/crp/grpc.ts
+import { GrpcTransport } from "@protobuf-ts/grpc-transport";
+import * as grpcJs from "@grpc/grpc-js";
+import { ensureMergeOptions } from "./transport-shim";
+
+// We import the generated v2 client directly.
+// NOTE: these are JS-compiled files distributed by the SDK.
+import {
+  QueriesClient,
+} from "@concordium/common-sdk/grpc/v2/concordium/service.client";
+
+// ---- Config ----
+export type GrpcConfig = {
+  host: string;
+  port: number;
+  tls: boolean;
+  network: "testnet" | "mainnet" | string;
+  caFile?: string;
+};
+
+export function getGrpcConfig(): GrpcConfig {
+  const host = process.env.CONCORDIUM_GRPC_HOST || "grpc.testnet.concordium.com";
+  const port = Number(process.env.CONCORDIUM_GRPC_PORT ?? 20000);
+  const tls = String(process.env.CONCORDIUM_GRPC_TLS ?? "true").toLowerCase() === "true";
+  const network = (process.env.CONCORDIUM_NETWORK as any) || "testnet";
+  const caFile = process.env.CONCORDIUM_GRPC_CA;
+
+  return { host, port, tls, network, caFile };
+}
+
+// ---- Transport ----
+function buildTransport(cfg: GrpcConfig) {
+  const authority = cfg.host; // SNI / :authority for TLS
+  const channelCredentials = cfg.tls
+    ? grpcJs.credentials.createSsl() // public testnet – system CAs are fine
+    : grpcJs.credentials.createInsecure();
+
+  // protobuf-ts transport
+  const base = new GrpcTransport({
+    host: `${cfg.host}:${cfg.port}`,
+    channelCredentials,
+    // authority ensures correct TLS SNI when host != IP
+    // (grpc.testnet.concordium.com)
+    // @ts-ignore (runtime supports it)
+    "grpc.ssl_target_name_override": authority,
+  } as any);
+
+  // Harden against environments where mergeOptions was missing
+  return ensureMergeOptions(base);
+}
+
+// Exported so routes can show diagnostics
+export async function getTransportDiagnostics() {
+  const cfg = getGrpcConfig();
+  return {
+    hasMergeOptions: true,
+    transportCtor: "GrpcTransport",
+    grpcJs: {
+      hasCredentials: typeof grpcJs.credentials?.createSsl === "function",
+    },
+    // keep it minimal and runtime-friendly
+  };
+}
+
+// ---- Client (lazily created once) ----
+let _client: QueriesClient | null = null;
+let _transport: ReturnType<typeof buildTransport> | null = null;
+
+export function getQueriesClient(): { client: QueriesClient; transport: ReturnType<typeof buildTransport> } {
+  if (_client && _transport) return { client: _client, transport: _transport };
+
+  const cfg = getGrpcConfig();
+  _transport = buildTransport(cfg);
+  _client = new QueriesClient(_transport);
+  return { client: _client!, transport: _transport! };
+}
+
+// ---- Helpers exposed to routes ----
+
+// Very light consensus summary that’s safe for wire JSON.
+export async function getConsensusSummary() {
+  const { client } = getQueriesClient();
+
+  // v2 GetConsensusInfo uses an Empty request object; protobuf-ts lets us pass {}
+  const { response } = await client.getConsensusInfo({});
+  // response has: { genesisIndex, bestBlock, lastFinalizedBlock, ... }
+  const genesisIndex =
+    response && typeof (response as any).genesisIndex?.value !== "undefined"
+      ? Number((response as any).genesisIndex.value)
+      : null;
+
+  // The generated client returns block hash as bytes (Uint8Array) in many shapes.
+  // We only expose hex strings here; heights are intentionally omitted
+  // unless fetched via additional calls.
+  const bestHashHex = toHex((response as any)?.bestBlock ?? new Uint8Array());
+  const finalizedHashHex = toHex((response as any)?.lastFinalizedBlock ?? new Uint8Array());
+
+  return {
+    ok: true,
+    consensus: {
+      genesisIndex,
+    },
+    blocks: {
+      best: { hash: bestHashHex, height: "" },
+      finalized: { hash: finalizedHashHex, height: "" },
+    },
+    network: getGrpcConfig().network,
+    _raw: response, // non-serializable BigInts won’t be present here
+  };
+}
+
+function toHex(u8: Uint8Array): string {
+  if (!u8 || typeof u8.length !== "number") return "";
+  return Buffer.from(u8).toString("hex");
+}
+
+// Address sanity – extremely light check; route will still 400 on bogus input
+export function validateAccountAddress(s: string): boolean {
+  // Concordium base58-check ccd1… addresses are 50+ chars, but we keep a len+prefix sanity here.
+  return typeof s === "string" && s.startsWith("ccd1") && s.length >= 40;
+}
+
+// Some code used a differently named helper earlier; export alias to avoid churn.
+export const isProbablyAccountAddress = validateAccountAddress;

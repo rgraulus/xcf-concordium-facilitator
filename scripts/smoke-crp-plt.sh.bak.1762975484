@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# scripts/smoke-crp-plt.sh
+# Smoke test for /v1/crp/payments/search showing scanned stats.
+# Usage:
+#   bash scripts/smoke-crp-plt.sh
+#   BASE=http://127.0.0.1:8080 TOKEN_ID="usd:test" bash scripts/smoke-crp-plt.sh
+
+set -euo pipefail
+
+BASE="${BASE:-http://localhost:8080}"
+TOKEN_ID="${TOKEN_ID:-usd:test}"
+
+pretty() {
+  # Try to pretty-print JSON; if it fails, dump raw.
+  if command -v python >/dev/null 2>&1; then
+    python - <<'PY' || cat
+import sys, json
+try:
+    print(json.dumps(json.load(sys.stdin), indent=4))
+except Exception:
+    sys.stdout.write(sys.stdin.read())
+PY
+  else
+    cat
+  fi
+}
+
+echo "== CRP PLT Search Smoke =="
+echo "Base URL: ${BASE}"
+
+echo
+echo "-- /v1/crp/payments/search (no filters, default limit)"
+curl -sS "${BASE}/v1/crp/payments/search" | pretty
+
+echo
+echo "-- /v1/crp/payments/search?tokenId=${TOKEN_ID}&limit=1 (example)"
+curl -sS "${BASE}/v1/crp/payments/search?tokenId=${TOKEN_ID}&limit=1" | pretty
+
+echo
+echo "Done."

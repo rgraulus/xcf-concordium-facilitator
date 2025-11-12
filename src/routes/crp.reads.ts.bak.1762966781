@@ -1,0 +1,109 @@
+// src/routes/crp.reads.ts
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { ChannelCredentials } from "@grpc/grpc-js";
+import { GrpcTransport } from "@protobuf-ts/grpc-transport";
+import type { RpcOptions } from "@protobuf-ts/runtime-rpc";
+import { QueriesClient } from "@concordium/common-sdk/grpc/v2/concordium/service.client";
+
+import { getGrpcConfig } from "../crp/grpc";
+
+/** Deeply convert bigint values to string so Fastify can serialize the payload. */
+function toJsonSafe<T>(value: T): T {
+  if (typeof value === "bigint") return (value.toString() as unknown) as T;
+  if (Array.isArray(value)) return (value.map(toJsonSafe) as unknown) as T;
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value as Record<string, unknown>)) {
+      out[k] = toJsonSafe((value as Record<string, unknown>)[k]);
+    }
+    return (out as unknown) as T;
+  }
+  return value;
+}
+
+function bytesToHex(b: unknown): string {
+  if (!b) return "";
+  if (Buffer.isBuffer(b)) return b.toString("hex");
+  // protobuf-ts often gives Uint8Array
+  if (b instanceof Uint8Array) return Buffer.from(b).toString("hex");
+  return String(b);
+}
+
+/** Build a QueriesClient with TLS/non-TLS according to env config. */
+function buildQueriesClient() {
+  const cfg = getGrpcConfig(); // { host, port, tls, network, caFile? }
+  const address = `${cfg.host}:${cfg.port}`;
+
+  const channelCredentials = cfg.tls
+    ? cfg.caFile
+      ? ChannelCredentials.createSsl(Buffer.from(cfg.caFile))
+      : ChannelCredentials.createSsl()
+    : ChannelCredentials.createInsecure();
+
+  const transport = new GrpcTransport({
+    host: address,
+    channelCredentials,
+  } as RpcOptions as any);
+
+  const client = new QueriesClient(transport);
+  return { client, cfg };
+}
+
+/** GET /v1/crp/consensus — minimal, BigInt-safe consensus readback (no blockInfo). */
+async function getConsensusHandler(_req: FastifyRequest, reply: FastifyReply) {
+  const { client, cfg } = buildQueriesClient();
+
+  const { response: consensus } = await client.getConsensusInfo({}, {});
+
+  const payload = toJsonSafe({
+    ok: true,
+    consensus: {
+      // genesisIndex is a protobuf "UInt64Value" wrapper in some builds => { value?: bigint }
+      genesisIndex:
+        // prefer number where safe; fallback to string
+        typeof (consensus as any)?.genesisIndex?.value === "bigint"
+          ? (Number((consensus as any).genesisIndex.value) as number)
+          : (consensus as any)?.genesisIndex?.value ?? null,
+    },
+    blocks: {
+      // We return the raw best/finalized block hashes as hex; heights omitted to avoid GetBlockInfo typing churn.
+      best: {
+        hash: bytesToHex((consensus as any)?.bestBlock),
+        height: "",
+      },
+      finalized: {
+        hash: bytesToHex((consensus as any)?.lastFinalizedBlock),
+        height: "",
+      },
+    },
+    network: cfg.network,
+  });
+
+  return reply.send(payload);
+}
+
+/** Very light account address check; your smoke uses an invalid example and expects 400. */
+function isProbablyAccountAddress(s: string): boolean {
+  return /^ccd1[0-9a-z]+$/i.test(s) && s.length >= 10;
+}
+
+/** GET /v1/crp/account/:address — dummy validator (returns 400 for invalid). */
+async function getAccountHandler(
+  req: FastifyRequest<{ Params: { address: string } }>,
+  reply: FastifyReply,
+) {
+  const addr = req.params.address;
+  if (!isProbablyAccountAddress(addr)) {
+    return reply.code(400).send({ error: "Invalid address" });
+  }
+  // placeholder success (real lookup can be added later)
+  return reply.send({ ok: true, address: addr });
+}
+
+export default async function routes(server: FastifyInstance) {
+  server.get("/consensus", getConsensusHandler);
+  server.get<{ Params: { address: string } }>(
+    "/account/:address",
+    getAccountHandler,
+  );
+}

@@ -1,7 +1,7 @@
-// src/crp/grpc.ts
+// src/crp/grpc.ts (drop-in)
 import { GrpcTransport } from "@protobuf-ts/grpc-transport";
 import * as grpcjs from "@grpc/grpc-js";
-import { QueriesClient } from "@concordium/common-sdk/grpc/v2/concordium/service.client";
+import { QueriesClient } from "@concordium/common-sdk/lib/GRPCClient";
 import { ensureMergeOptions } from "../crp/transport-shim";
 
 // ---------- Config ----------
@@ -24,11 +24,12 @@ export function getGrpcConfig(): GrpcCfg {
 
 // ---------- Diagnostics ----------
 export async function getTransportDiagnostics() {
-  return {
+  const d: any = {
     hasMergeOptions: true,
     transportCtor: "GrpcTransport",
     grpcJs: { hasCredentials: !!grpcjs.credentials },
   };
+  return d;
 }
 
 // ---------- Transport / Client ----------
@@ -38,6 +39,7 @@ function makeTransport(cfg: GrpcCfg): GrpcTransport {
     ? grpcjs.credentials.createSsl()          // public node, system CAs OK
     : grpcjs.credentials.createInsecure();
 
+  // as per @protobuf-ts/grpc-transport options
   const t = new GrpcTransport({
     host: target,
     channelCredentials: creds,
@@ -57,7 +59,7 @@ export function getQueriesClient(): QueriesClient {
 const asBytes = (b: any): Uint8Array | undefined => {
   if (!b) return undefined;
   if (b instanceof Uint8Array) return b;
-  if (b?.value instanceof Uint8Array) return b.value; // protobuf-ts wrapper
+  if (b?.value instanceof Uint8Array) return b.value;
   if (Array.isArray(b)) return Uint8Array.from(b);
   return undefined;
 };
@@ -65,42 +67,29 @@ const asBytes = (b: any): Uint8Array | undefined => {
 const toHex = (u?: Uint8Array | string): string =>
   typeof u === "string" ? u : (u ? Buffer.from(u).toString("hex") : "");
 
-// unwrap numeric fields that sometimes appear as { value: number }
-const num = (v: any): number | null => (typeof v === "number") ? v : (v && typeof v.value === "number" ? v.value : null);
-
-
-// ---------- Public mapping helper ----------
-export function mapConsensusInfoToSummary(info: any) {
-  const gi = info?.genesisIndex?.value ?? info?.genesisIndex ?? null;
-  const bestHex = toHex(asBytes(info?.bestBlock));
-  const finalizedHex = toHex(asBytes(info?.lastFinalizedBlock));
-  return {
-    consensus: { genesisIndex: gi },
-    blocks: {
-      best:      { hash: bestHex,      height: "" },
-      finalized: { hash: finalizedHex,  height: "" },
-    },
-  };
-}
-
 // ---------- Public API ----------
 export async function getConsensusSummary() {
   const client = getQueriesClient();
-  // protobuf-ts returns a UnaryCall; you must await `.response`
-  const { response } = client.getConsensusInfo({});
-  const info = await response;
+  const info: any = await client.getConsensusInfo({});
 
-  const summary = mapConsensusInfoToSummary(info);
+  const bestHex = toHex(asBytes(info.bestBlock));
+  const finalizedHex = toHex(asBytes(info.lastFinalizedBlock));
+
   return {
     ok: true,
-    ...summary,
+    consensus: { genesisIndex: info?.genesisIndex ?? null },
+    blocks: {
+      best: { hash: bestHex, height: "" },        // height omitted to avoid BigInt serialization
+      finalized: { hash: finalizedHex, height: "" }
+    },
     network: getGrpcConfig().network,
   };
 }
 
 // Conservative address validator (keeps earlier imports happy)
 export function isProbablyAccountAddress(s: string): boolean {
-  // Concordium account addresses often start with 'ccd1' (bech32) or are base58-like (~50 chars).
+  // Concordium account addresses typically start with '3' (base58) or 'ccd1' (bech32),
+  // bech32 length ~ 55, base58 ~ 50; we only do a soft gate here.
   if (typeof s !== "string" || s.length < 20) return false;
   if (s.startsWith("ccd1")) return true;
   if (/^[1-9A-HJ-NP-Za-km-z]+$/.test(s) && s.length >= 30) return true; // base58-ish
