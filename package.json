@@ -15,7 +15,8 @@
     "smoke:idempotency": "bash scripts/smoke-idempotency.sh",
     "smoke:crp": "bash scripts/smoke-crp-reads.sh",
     "smoke:plt": "bash scripts/smoke-crp-plt.sh",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:ci": "echo \"No tests yet (CI)\" && exit 0"
   },
   "repository": {
     "type": "git",
