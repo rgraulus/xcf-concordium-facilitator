@@ -1,0 +1,72 @@
+{
+  "name": "xcf-concordium-facilitator",
+  "version": "1.0.0",
+  "description": "**XCF Consists of:**\r - **UFX (Universal Facilitator for x402):** rail-agnostic core that exposes the x402-friendly API, enforces idempotency/expiry, orchestrates policy checks, signs verifiable receipts (JWS), and emits webhooks/metrics.\r - **CRP (Concordium Rail Plugin):** rail-specific adapter that reads **finalized** Concordium PLT (protocol-level token) events via gRPC v2 and matches exact payments.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "schema:check": "ajv compile --spec=draft2020 -c ajv-formats -s schemas/challenge.schema.json && ajv compile --spec=draft2020 -c ajv-formats -s schemas/receipt.schema.json",
+    "build": "tsc -p tsconfig.json && npm run postbuild:copy-schemas",
+    "postbuild:copy-schemas": "node -e \"const fs=require('fs');try{fs.cpSync('schemas','dist/schemas',{recursive:true});console.log('Copied schemas/ -> dist/schemas');}catch(e){if(e.code!=='ENOENT') throw e;}\"",
+    "start": "node dist/server.js",
+    "health": "curl -s http://localhost:8080/v1/crp/health | python -m json.tool",
+    "smoke:idempotency": "bash scripts/smoke-idempotency.sh",
+    "smoke:crp": "bash scripts/smoke-crp-reads.sh",
+    "smoke:plt": "bash scripts/smoke-crp-plt.sh",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:ci": "npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rgraulus/xcf-concordium-facilitator.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/rgraulus/xcf-concordium-facilitator/issues"
+  },
+  "homepage": "https://github.com/rgraulus/xcf-concordium-facilitator#readme",
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^24.9.2",
+    "@types/node-fetch": "^2.6.13",
+    "@types/pg": "^8.15.6",
+    "ajv": "^8.17.1",
+    "ajv-cli": "^5.0.0",
+    "ajv-formats": "^3.0.1",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@concordium/node-sdk": "9.4.0",
+    "@grpc/grpc-js": "^1.14.0",
+    "dotenv": "^17.2.3",
+    "fastify": "^5.6.1",
+    "fastify-plugin": "^5.1.0",
+    "jose": "^6.1.0",
+    "pg": "^8.16.3",
+    "@protobuf-ts/grpc-transport": "2.11.1",
+    "@protobuf-ts/runtime-rpc": "2.11.1",
+    "@protobuf-ts/runtime": "2.11.1"
+  },
+  "overrides": {
+    "@concordium/node-sdk": {
+      "@protobuf-ts/grpc-transport": "2.11.1",
+      "@protobuf-ts/runtime-rpc": "2.11.1",
+      "@protobuf-ts/runtime": "2.11.1"
+    },
+    "@concordium/common-sdk": {
+      "@protobuf-ts/grpc-transport": "2.11.1",
+      "@protobuf-ts/runtime-rpc": "2.11.1",
+      "@protobuf-ts/runtime": "2.11.1"
+    },
+    "@protobuf-ts/grpc-transport": "2.11.1",
+    "@protobuf-ts/runtime-rpc": "2.11.1",
+    "@protobuf-ts/runtime": "2.11.1"
+  }
+}
