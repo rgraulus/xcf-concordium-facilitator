@@ -44,15 +44,16 @@
   },
   "dependencies": {
     "@concordium/node-sdk": "9.4.0",
+    "@concordium/web-sdk": "^11.0.0",
     "@grpc/grpc-js": "^1.14.0",
+    "@protobuf-ts/grpc-transport": "2.11.1",
+    "@protobuf-ts/runtime": "2.11.1",
+    "@protobuf-ts/runtime-rpc": "2.11.1",
     "dotenv": "^17.2.3",
     "fastify": "^5.6.1",
     "fastify-plugin": "^5.1.0",
     "jose": "^6.1.0",
-    "pg": "^8.16.3",
-    "@protobuf-ts/grpc-transport": "2.11.1",
-    "@protobuf-ts/runtime-rpc": "2.11.1",
-    "@protobuf-ts/runtime": "2.11.1"
+    "pg": "^8.16.3"
   },
   "overrides": {
     "@concordium/node-sdk": {
