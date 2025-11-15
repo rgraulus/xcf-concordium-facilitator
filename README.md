@@ -69,3 +69,20 @@ A payer scans a QR (or taps NFC), sends the exact PLT amount to the `pay_to` add
 
 Status: **M3 is implemented and merged into `main`.**
 
+### M4 – Exact match & webhook for CRP payments
+
+M4 adds two helper routes under `/v1/crp` for working with PLT-based payment challenges:
+
+- `GET  /v1/crp/payments/search`  
+  Search challenges/payments by tuple filters (existing route).
+
+- `POST /v1/crp/payments/match`  
+  Pure read-only **exact tuple match**. Validates the full tuple:  
+  `merchantId, nonce, network, asset{type, tokenId, decimals}, amount, payTo`.  
+  Returns either `reason: "exact_match"` with a single row, or `reason: "no_match"`.
+
+- `POST /v1/crp/payments/fulfill`  
+  Uses the same exact-tuple match as `/payments/match`, but is intended as the
+  **gateway “fulfill” entrypoint**. On success it can also POST a JSON payload
+  to a merchant-specific webhook.
+
