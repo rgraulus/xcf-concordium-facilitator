@@ -23,7 +23,6 @@ export function getGrpcConfig(): GrpcCfg {
 // ---------- Diagnostics ----------
 
 export async function getTransportDiagnostics() {
-  // Keep the shape stable for existing /health usage.
   return {
     hasMergeOptions: true,
     transportCtor: "ConcordiumGRPCNodeClient",
@@ -42,7 +41,6 @@ let _client: ConcordiumClient | null = null;
 
 async function getConcordiumClient(): Promise<ConcordiumClient> {
   if (_client !== null) {
-    // TS now knows this is ConcordiumClient, not null.
     return _client;
   }
 
@@ -73,7 +71,6 @@ async function getConcordiumClient(): Promise<ConcordiumClient> {
     { timeout: 15_000 }
   );
 
-  // At this point _client has been initialized, so we can assert non-null.
   return _client as ConcordiumClient;
 }
 
@@ -103,11 +100,19 @@ const num = (v: any): number | null =>
     ? v.value
     : null;
 
-// hash can be bytes or string, normalize to hex string
+// hash can be different shapes; normalize to hex/string
 const normalizeHash = (h: any): string => {
   if (!h) return "";
   if (typeof h === "string") return h;
-  return toHex(asBytes(h));
+
+  // Common object shapes
+  if (typeof (h as any).blockHash === "string") return (h as any).blockHash;
+  if (typeof (h as any).hash === "string") return (h as any).hash;
+  if (typeof (h as any).value === "string") return (h as any).value;
+
+  // Fall back to bytes -> hex
+  const bytes = asBytes(h);
+  return bytes ? toHex(bytes) : "";
 };
 
 // ---------- Public mapping helper ----------
@@ -127,23 +132,27 @@ export function mapConsensusInfoToSummary(info: any) {
   };
 }
 
+// ---------- Raw debug helper ----------
+
+export async function debugConsensusInfoRaw(): Promise<any> {
+  const client = await getConcordiumClient();
+
+  if (typeof client.getConsensusInfo === "function") {
+    return client.getConsensusInfo();
+  }
+  if (typeof client.getConsensusStatus === "function") {
+    return client.getConsensusStatus();
+  }
+
+  throw new Error(
+    "Concordium client has no getConsensusInfo/getConsensusStatus method"
+  );
+}
+
 // ---------- Public API ----------
 
 export async function getConsensusSummary() {
-  const client = await getConcordiumClient();
-
-  // 11.0.0 exposes a consensus call; we support both names just in case.
-  let info: any;
-  if (typeof client.getConsensusInfo === "function") {
-    info = await client.getConsensusInfo();
-  } else if (typeof client.getConsensusStatus === "function") {
-    info = await client.getConsensusStatus();
-  } else {
-    throw new Error(
-      "Concordium client has no getConsensusInfo/getConsensusStatus method"
-    );
-  }
-
+  const info = await debugConsensusInfoRaw();
   const summary = mapConsensusInfoToSummary(info);
   return {
     ok: true,
@@ -154,9 +163,6 @@ export async function getConsensusSummary() {
 
 // ---------- Address validation ----------
 
-// We keep this deliberately *permissive* so that:
-// - The smoke test address `ccd1qexampleaddress` passes.
-// - We still reject clearly junk inputs (too short, non-alphanumeric).
 export function isProbablyAccountAddress(s: string): boolean {
   if (typeof s !== "string") return false;
 

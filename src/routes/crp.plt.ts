@@ -1,13 +1,14 @@
-// src/routes/crp.payments.ts
+// src/routes/crp.plt.ts
 //
-// GET /v1/crp/payments/search
+// /v1/crp/payments/search
 //
 // Search challenges/payments using the tuple:
 //   merchantId, network, tokenId, pay_to, status, limit
 //
-// This currently searches only the `challenges` table via searchPayments().
-// Later, once PLT ingestion is wired, we can extend the response to include
-// on-chain PLT transfer match info.
+// This does *not* yet join against PLT transfers. It simply
+// returns matching challenges from the `challenges` table.
+// Later, once PLT ingestion is wired, we can extend the
+// response to include on-chain match info.
 
 import type { FastifyInstance } from "fastify";
 import {
@@ -62,4 +63,3 @@ export default async function routes(server: FastifyInstance) {
     };
   });
 }
-
