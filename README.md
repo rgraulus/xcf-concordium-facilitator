@@ -28,101 +28,44 @@ A payer scans a QR (or taps NFC), sends the exact PLT amount to the `pay_to` add
 ---
 
 ## 🧭 Milestones (status)
-- **M1 (done)** – UFX API skeleton: routes, auth, schemas, JWKS, idempotency table.
-- **M2 (done)** – CRP wiring: gRPC v2 client, `/v1/crp/health`, `/v1/crp/consensus`, fast-path `/v1/crp/payments/search`.
-- **Next** – Stream finalized blocks, PLT traversal/match, webhooks, security pass.
+### M1 – UFX API skeleton
 
----
+- Node/TypeScript + Fastify service
+- Basic health endpoints:
+  - `GET /healthz`
+  - `GET /v1/crp/health`
 
-## 🚀 Quick start (dev)
+### M2 – CRP wiring (gRPC v2)
 
-### 1) Install
-```bash
-npm i
-2) Environment
-Create .env (example for testnet):
+- Concordium testnet gRPC wiring via `src/crp/grpc.ts`
+- Consensus & account reads:
+  - `GET /v1/crp/consensus`
+  - `GET /v1/crp/account/:address`
+- Basic CRP payments search stub
+- Local smoke tests:
+  - `npm run smoke:crp`
+  - `npm run smoke:plt` (initial stub)
 
-ini
-Copy code
-PORT=8080
-HOST=0.0.0.0
+### M3 – PLT stream ingest & CRP payments search
 
-# Concordium gRPC (testnet public node)
-CONCORDIUM_GRPC_HOST=grpc.testnet.concordium.com
-CONCORDIUM_GRPC_PORT=20000
-CONCORDIUM_GRPC_TLS=true
-CONCORDIUM_NETWORK=testnet
+- Database migration for PLT stream ingest:
+  - `db/migrations/002_m3_stream.sql`
+- PLT decimals & parsing:
+  - `src/crp/decimals-registry.ts`
+  - `src/crp/parser.ts`
+- Stream worker & stream control:
+  - `src/crp/stream.ts`
+  - `src/crp/stream-worker.ts`
+- Postgres stores:
+  - `src/store/plt.pg.ts` – PLT events
+  - `src/store/match.pg.ts` – matched payments
+- CRP routes:
+  - `GET /v1/crp/payments/search`
+    - Filters: `merchantId`, `status`, `limit` (and default unfiltered listing)
+- Demo tooling:
+  - `scripts/migrate-002-m3-stream.js` – apply M3 migration
+  - `scripts/debug-*.js` – consensus, PLT events, seeding demo challenges
+  - `scripts/smoke-idempotency.sh` – create/idempotent/409 conflict flow for JWS receipts
 
-# JWKS / JWS signing (optional for PoC receipts)
-JWS_PRIVATE_KEY_BASE64=...base64-ed25519-private-key...
-JWS_KID=kid-dev-1
-JWS_ALG=EdDSA
-3) Build & Run
-bash
-Copy code
-npm run build
-npm run start
-🧪 Smoke checks
-bash
-Copy code
-# Liveness
-curl -s http://localhost:8080/healthz | jq .
+Status: **M3 is implemented and merged into `main`.**
 
-# CRP health (verifies host/port/TLS actually in use)
-curl -s http://localhost:8080/v1/crp/health | jq .
-
-# Consensus (hashes are 64-char hex; heights may be empty by design)
-curl -s http://localhost:8080/v1/crp/consensus | jq .
-
-# PLT search (fast path; matches may be empty)
-curl -s "http://localhost:8080/v1/crp/payments/search" | jq .
-Or via helper scripts:
-
-bash
-Copy code
-npm run smoke:crp
-npm run smoke:plt
-🛣️ Public API (auth required)
-POST /v1/challenges — register a challenge (idempotent by nonce)
-
-POST /v1/verify — ad-hoc verify inline x402 payloads (no pre-registration)
-
-GET /v1/challenges/:nonce/status — poll status
-
-POST /v1/receipts/verify — helper to verify JWS receipts server-side
-
-GET /.well-known/jwks.json — JWKS for public keys (receipts)
-
-GET /supported — discovery of schemes/networks/assets
-
-Ops: GET /healthz, GET /v1/crp/health, GET /v1/crp/consensus, GET /metrics
-
-/supported example
-
-json
-Copy code
-{"schemes":["exact"],"networks":["concordium:testnet","concordium:mainnet"],"assets":[{"type":"PLT","tokenId":"USDQ","decimals":2}]}
-📁 Repo structure (current highlights)
-bash
-Copy code
-/src
-  server.ts               # Fastify, health, route wiring
-  /routes
-    crp.health.ts         # /v1/crp/health
-    crp.reads.ts          # /v1/crp/consensus
-    crp.payments.ts       # /v1/crp/payments/search (fast-path)
-  /crp
-    grpc.ts               # gRPC v2 Queries client
-    transport-shim.ts     # mergeOptions shim for grpc transport
-/schemas                  # Ajv JSON schemas
-/scripts                  # probes & smoke helpers
-✅ Definition of Done (PoC)
-Finality-only matching + strict equality tuple
-
-Idempotency semantics enforced (409 vs 422)
-
-Signed receipt (JWS) verifiable via /.well-known/jwks.json
-
-Health endpoints and quick smoke scripts
-
-Demo: terminal gets green check on exact payment
