@@ -1,6 +1,6 @@
 // src/webhook.ts
 //
-// Minimal webhook helper for CRP payment fulfillment.
+// Webhook helper for CRP payment fulfillment.
 //
 // - Per-merchant webhook URL from environment variables.
 // - No extra dependencies: uses Node's http/https + URL.
@@ -29,14 +29,13 @@
 import { request as httpRequest } from "http";
 import { request as httpsRequest } from "https";
 import { URL } from "url";
+import type {
+  CrpWebhookPayload,
+  CrpWebhookResult,
+} from "./contracts/crpGateway";
 
-export interface WebhookResult {
-  configured: boolean;
-  attempted: boolean;
-  ok: boolean;
-  status?: number;
-  error?: string;
-}
+// Backwards-compatible alias so existing imports of WebhookResult still work.
+export type WebhookResult = CrpWebhookResult;
 
 /**
  * Normalize merchantId into the env var suffix.
@@ -64,15 +63,15 @@ export function getWebhookUrlForMerchant(
 }
 
 /**
- * POST a JSON payload to the merchant webhook URL, if configured.
+ * POST a CRP webhook payload to the merchant webhook URL, if configured.
  *
- * Returns a WebhookResult that callers can embed in their response.
+ * Returns a CrpWebhookResult that callers can embed in their response.
  */
 export async function postPaymentWebhook(
   merchantId: string,
-  body: unknown,
+  payload: CrpWebhookPayload,
   timeoutMs = 3000
-): Promise<WebhookResult> {
+): Promise<CrpWebhookResult> {
   const cfg = getWebhookUrlForMerchant(merchantId);
   if (!cfg) {
     // No webhook configured for this merchant.
@@ -90,7 +89,7 @@ export async function postPaymentWebhook(
     const isHttps = target.protocol === "https:";
     const reqFn = isHttps ? httpsRequest : httpRequest;
 
-    return await new Promise<WebhookResult>((resolve) => {
+    return await new Promise<CrpWebhookResult>((resolve) => {
       const req = reqFn(
         {
           hostname: target.hostname,
@@ -138,7 +137,7 @@ export async function postPaymentWebhook(
       });
 
       try {
-        const json = JSON.stringify(body ?? {});
+        const json = JSON.stringify(payload ?? {});
         req.write(json);
       } catch (err) {
         // JSON serialization error – treat as failure.
