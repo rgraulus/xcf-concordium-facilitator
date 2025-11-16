@@ -32,25 +32,37 @@ import {
   type PaymentSearchFilters,
 } from "../store/match.pg";
 import { postPaymentWebhook } from "../webhook";
+import type {
+  CrpMatchRequest,
+  CrpFulfillRequest,
+  CrpPaymentRecord,
+  CrpWebhookPayload,
+  CrpNetwork,
+  CrpAsset,
+} from "../contracts/crpGateway";
 
-// Local representation of the tuple we expect from the gateway.
-type PaymentMatchInput = {
-  merchantId: string;
-  nonce: string;
-  network: string;
-  asset: {
-    type: string;
-    tokenId: string;
-    decimals: number;
+// For clarity in this module:
+type PaymentMatchInput = CrpMatchRequest;
+
+// Narrow helpers for runtime casting.
+function toCrpNetwork(value: unknown): CrpNetwork {
+  return String(value ?? "").trim() as CrpNetwork;
+}
+
+function toCrpAsset(raw: any): CrpAsset {
+  return {
+    type: String(raw?.type ?? "").trim() as CrpAsset["type"],
+    tokenId: String(raw?.tokenId ?? "").trim(),
+    decimals: Number(raw?.decimals ?? 0),
   };
-  amount: string;
-  payTo: string;
-};
+}
 
 // Helper: perform an exact-tuple match by:
 // 1) Using searchPayments with a reasonably tight filter.
 // 2) Doing an in-memory exact comparison on the remaining fields.
-async function findExactMatch(input: PaymentMatchInput) {
+async function findExactMatch(
+  input: PaymentMatchInput
+): Promise<CrpPaymentRecord | null> {
   const filters: PaymentSearchFilters = {
     merchantId: input.merchantId,
     network: input.network,
@@ -60,10 +72,10 @@ async function findExactMatch(input: PaymentMatchInput) {
     limit: 100,
   };
 
-  const rows = await searchPayments(filters);
+  const rows = (await searchPayments(filters)) as CrpPaymentRecord[];
 
-  const match = (rows as any[]).find((row) => {
-    const asset = row.asset || {};
+  const match = rows.find((row) => {
+    const asset = row.asset;
     return (
       row.nonce === input.nonce &&
       row.amount === input.amount &&
@@ -129,17 +141,13 @@ export default async function routes(server: FastifyInstance) {
   // Exact-tuple match, read-only. No webhook.
   //
   server.post("/payments/match", async (req, reply) => {
-    const body = (req.body || {}) as any;
+    const body = (req.body || {}) as Partial<CrpMatchRequest> & { [k: string]: unknown };
 
-    const input: PaymentMatchInput = {
+    const input: CrpMatchRequest = {
       merchantId: String(body.merchantId ?? "").trim(),
       nonce: String(body.nonce ?? "").trim(),
-      network: String(body.network ?? "").trim(),
-      asset: {
-        type: String(body.asset?.type ?? "").trim(),
-        tokenId: String(body.asset?.tokenId ?? "").trim(),
-        decimals: Number(body.asset?.decimals ?? 0),
-      },
+      network: toCrpNetwork(body.network),
+      asset: toCrpAsset(body.asset),
       amount: String(body.amount ?? "").trim(),
       payTo: String(body.payTo ?? "").trim(),
     };
@@ -189,17 +197,13 @@ export default async function routes(server: FastifyInstance) {
   // - Triggers a webhook POST (if configured) with the matched payment.
   //
   server.post("/payments/fulfill", async (req, reply) => {
-    const body = (req.body || {}) as any;
+    const body = (req.body || {}) as Partial<CrpFulfillRequest> & { [k: string]: unknown };
 
-    const input: PaymentMatchInput = {
+    const input: CrpFulfillRequest = {
       merchantId: String(body.merchantId ?? "").trim(),
       nonce: String(body.nonce ?? "").trim(),
-      network: String(body.network ?? "").trim(),
-      asset: {
-        type: String(body.asset?.type ?? "").trim(),
-        tokenId: String(body.asset?.tokenId ?? "").trim(),
-        decimals: Number(body.asset?.decimals ?? 0),
-      },
+      network: toCrpNetwork(body.network),
+      asset: toCrpAsset(body.asset),
       amount: String(body.amount ?? "").trim(),
       payTo: String(body.payTo ?? "").trim(),
     };
@@ -237,12 +241,12 @@ export default async function routes(server: FastifyInstance) {
       };
     }
 
-    // Webhook body can evolve, but for now we send a simple envelope
-    // containing the matched payment row.
-    const webhook = await postPaymentWebhook(input.merchantId, {
+    const webhookPayload: CrpWebhookPayload = {
       kind: "crp.payment.fulfilled",
       payment: match,
-    });
+    };
+
+    const webhook = await postPaymentWebhook(input.merchantId, webhookPayload);
 
     return {
       ok: true,
