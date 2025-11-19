@@ -1,4 +1,4 @@
-// src/server.ts (clean drop-in)
+// src/server.ts
 import "dotenv/config";
 import Fastify, { FastifyInstance, FastifyPluginCallback } from "fastify";
 
@@ -11,6 +11,9 @@ import * as challengesMod from "./routes/challenges";
 import * as crpReadsMod from "./routes/crp.reads";
 import * as crpPaymentsMod from "./routes/crp.payments";
 import * as crpHealthMod from "./routes/crp.health";
+
+// New: exact-match alias plugin
+import crpExactMatchAliasPlugin from "./http/crpExactMatchAlias";
 
 // --- Small helper to register either default export or the module itself ---
 function asPlugin(mod: any): FastifyPluginCallback {
@@ -40,10 +43,23 @@ export async function buildServer(): Promise<FastifyInstance> {
   server.register(asPlugin(crpReadsMod), { prefix: "/v1/crp" });
   server.register(asPlugin(crpPaymentsMod), { prefix: "/v1/crp" });
 
+  // NEW: exact-tuple alias endpoint under the same /v1/crp namespace.
+  // We register this one directly (no asPlugin wrapper) to avoid ambiguity.
+  server.register(crpExactMatchAliasPlugin, { prefix: "/v1/crp" });
+
   // Not found handler (keeps default Fastify 404 body but ensures logging)
   server.setNotFoundHandler((req, reply) => {
-    req.log.info({ url: req.raw.url, method: req.raw.method }, "Route not found");
-    reply.code(404).send({ message: `Route ${req.method}:${req.url} not found`, error: "Not Found", statusCode: 404 });
+    req.log.info(
+      { url: req.raw.url, method: req.raw.method },
+      "Route not found"
+    );
+    reply
+      .code(404)
+      .send({
+        message: `Route ${req.method}:${req.url} not found`,
+        error: "Not Found",
+        statusCode: 404,
+      });
   });
 
   return server;
@@ -61,11 +77,14 @@ async function start() {
     const addrs = server.addresses();
     if (Array.isArray(addrs)) {
       for (const addr of addrs) {
-        server.log.info(`Server listening at http://${(addr as any).address}:${(addr as any).port}`);
+        server.log.info(
+          `Server listening at http://${(addr as any).address}:${(addr as any).port}`
+        );
       }
     }
     server.log.info("UFX listening on :%d", port);
   } catch (err) {
+    // eslint-disable-next-line no-console
     console.error(err);
     process.exit(1);
   }
@@ -73,5 +92,6 @@ async function start() {
 
 // Run only if executed directly
 if (require.main === module) {
+  // eslint-disable-next-line @typescript-eslint/no-floating-promises
   start();
 }
