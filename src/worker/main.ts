@@ -1,177 +1,162 @@
-import { FakePltEventSource, PltEventSource } from "./pltSource";
+// src/worker/main.ts
 
-/**
- * Core configuration for the CRP stream worker.
- *
- * For now, we support a simple demo mode:
- * - Fake PLT events
- * - Dry-run only (log "would process" instead of writing to DB)
- */
-export interface CrpStreamWorkerConfig {
+import { getPltDecimals, PltAssetKey } from './pltDecimals';
+import { FakePltEventSource } from './pltSource';
+
+export interface WorkerConfig {
+  /** How often to poll for new events (ms). */
   pollIntervalMs: number;
+
+  /** Network identifier, e.g. "concordium:testnet". */
   network: string;
+
+  /** PLT token identifier, e.g. "usd:test". */
   tokenId: string;
+
+  /** If true, do not persist or emit anything; just log. */
   dryRun: boolean;
 
-  /**
-   * Last finalized PLT event height we've processed.
-   * This will later come from / persist to the database or a checkpoint table.
-   */
+  /** Last processed height (inclusive). */
   lastHeight: number;
 
-  /**
-   * Optional guard so demos don't run forever.
-   * If set, the worker will stop after this many polling iterations.
-   */
+  /** Optional safety cap on the number of polling ticks. */
   maxTicks?: number;
 }
 
 /**
- * Small helper to sleep between polling iterations.
+ * Core worker loop: polls a PLT event source and processes events.
+ *
+ * For now this is wired to the demo source only; later we can swap in
+ * a real Concordium PLT event source while keeping the loop unchanged.
  */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * For now, we parse a "demo config" from environment variables with
- * safe defaults, matching what we've used in earlier steps.
- */
-function parseDemoConfigFromEnv(): CrpStreamWorkerConfig {
-  const pollIntervalMs = Number(process.env.CRP_STREAM_POLL_INTERVAL_MS ?? "2000");
-  const network = process.env.CRP_STREAM_NETWORK ?? "concordium:testnet";
-  const tokenId = process.env.CRP_STREAM_TOKEN_ID ?? "usd:test";
-
-  // Default to dry-run=true unless explicitly set to "false"
-  const dryRunEnv = process.env.CRP_STREAM_DRY_RUN ?? "true";
-  const dryRun = dryRunEnv.toLowerCase() !== "false";
-
-  // For demos, limit to 3 ticks unless overridden
-  const maxTicksEnv = process.env.CRP_STREAM_MAX_TICKS ?? "3";
-  const maxTicks = Number(maxTicksEnv);
-
-  return {
+export async function runWorker(config: WorkerConfig): Promise<void> {
+  const {
     pollIntervalMs,
     network,
     tokenId,
     dryRun,
-    lastHeight: 0,
     maxTicks,
-  };
-}
+  } = config;
 
-/**
- * One polling iteration:
- * - fetch events above lastHeight from the PLT event source
- * - process them (for now, just log)
- * - return the new lastHeight
- */
-async function runWorkerTick(
-  source: PltEventSource,
-  cfg: CrpStreamWorkerConfig
-): Promise<number> {
-  const { lastHeight } = cfg;
+  let { lastHeight } = config;
 
-  const events = await source.fetchEventsAboveHeight(lastHeight);
+  // Build the asset key expected by the decimals registry.
+  const assetKey: PltAssetKey = { network, tokenId };
+  const decimals = getPltDecimals(assetKey) ?? 0;
 
-  if (events.length === 0) {
-    // Nothing new; no change in lastHeight.
-    return lastHeight;
-  }
+  // For now we always use the demo source. Later we can switch on an
+  // environment variable or config flag to choose a real gRPC source.
+  const source = new FakePltEventSource({ network, tokenId });
 
+  // eslint-disable-next-line no-console
   console.log(
-    `[CRP-STREAM] fetched ${events.length} fake event(s) above height ${lastHeight}`
+    '[CRP-STREAM] starting worker with config:',
+    JSON.stringify(
+      {
+        pollIntervalMs,
+        network,
+        tokenId,
+        dryRun,
+        lastHeight,
+        maxTicks,
+      },
+      null,
+      2
+    )
   );
 
-  let newLastHeight = lastHeight;
-
-  for (const ev of events) {
-    if (cfg.dryRun) {
-      console.log(
-        "[CRP-STREAM] (dry-run) would process event:",
-        { height: ev.height, txHash: ev.txHash }
-      );
-    } else {
-      // Later: real processing -> DB updates, PLT decoding, etc.
-      console.log(
-        "[CRP-STREAM] processing event (TODO implement real handler):",
-        { height: ev.height, txHash: ev.txHash }
-      );
-    }
-
-    if (ev.height > newLastHeight) {
-      newLastHeight = ev.height;
-    }
-  }
-
-  return newLastHeight;
-}
-
-/**
- * Main worker loop: repeatedly call runWorkerTick with a sleep in between.
- */
-export async function runCrpStreamWorker(
-  cfg: CrpStreamWorkerConfig,
-  source: PltEventSource
-): Promise<void> {
-  console.log("[CRP-STREAM] starting worker with config:", cfg);
-
-  let lastHeight = cfg.lastHeight;
   let ticks = 0;
+  let running = true;
 
-  while (true) {
+  while (running) {
     ticks += 1;
 
-    lastHeight = await runWorkerTick(source, { ...cfg, lastHeight });
+    const events = await source.fetchSince(lastHeight);
 
-    // For demos, stop after maxTicks if provided
-    if (cfg.maxTicks && ticks >= cfg.maxTicks) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `[CRP-STREAM] fetched ${events.length} PLT event(s) above height ${lastHeight}`
+    );
+
+    for (const ev of events) {
+      // Update lastHeight to the highest height we've seen so far.
+      if (ev.height > lastHeight) {
+        lastHeight = ev.height;
+      }
+
+      // This is where real processing would happen:
+      // - decode PLT event payload
+      // - match against CRP payments
+      // - persist offsets, etc.
+      //
+      // For now we just log a dry-run line that demonstrates usage of
+      // the decimals registry and basic event metadata.
+      const fmt =
+        `height=${ev.height}, txHash=${ev.txHash}, ` +
+        `tokenId=${tokenId}, decimals=${decimals}`;
+
+      // eslint-disable-next-line no-console
       console.log(
-        `[CRP-STREAM] maxTicks (${cfg.maxTicks}) reached, stopping loop.`
+        dryRun
+          ? `[CRP-STREAM] (dry-run) would process PLT event: ${fmt}`
+          : `[CRP-STREAM] processing PLT event: ${fmt}`
       );
+    }
+
+    if (typeof maxTicks === 'number' && ticks >= maxTicks) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[CRP-STREAM] maxTicks (${maxTicks}) reached, stopping loop.`
+      );
+      running = false;
       break;
     }
 
-    await sleep(cfg.pollIntervalMs);
+    if (!running) {
+      break;
+    }
+
+    if (pollIntervalMs > 0 && running) {
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
   }
 
-  console.log("[CRP-STREAM] worker stopped.");
+  // eslint-disable-next-line no-console
+  console.log('[CRP-STREAM] worker stopped.');
 }
 
 /**
- * Entry point for the demo script (npm run crp:worker:demo).
- *
- * For now, we always construct a FakePltEventSource, but the structure
- * is set up so we can later:
- * - Switch to a RealPltEventSource (Concordium gRPC) based on env flags
- * - Inject mocks for tests
+ * Demo runner that constructs a WorkerConfig with sensible defaults
+ * and runs the worker once (used by npm run crp:worker:demo).
  */
-async function main(): Promise<void> {
-  const cfg = parseDemoConfigFromEnv();
+export async function runDemo(): Promise<void> {
+  const demoConfig: WorkerConfig = {
+    pollIntervalMs: 2000,
+    network: 'concordium:testnet',
+    tokenId: 'usd:test',
+    dryRun: true,
+    lastHeight: 0,
+    maxTicks: 3,
+  };
 
-  console.log("[CRP-STREAM] demo runner starting with config:", {
-    pollIntervalMs: cfg.pollIntervalMs,
-    network: cfg.network,
-    tokenId: cfg.tokenId,
-    dryRun: cfg.dryRun,
-    maxTicks: cfg.maxTicks,
-  });
+  // eslint-disable-next-line no-console
+  console.log(
+    '[CRP-STREAM] demo runner starting with config:',
+    JSON.stringify(demoConfig, null, 2)
+  );
 
-  const source = new FakePltEventSource({
-    network: cfg.network,
-    tokenId: cfg.tokenId,
-  });
-
-  await runCrpStreamWorker(cfg, source);
-
-  console.log("[CRP-STREAM] demo runner finished.");
+  try {
+    await runWorker(demoConfig);
+    // eslint-disable-next-line no-console
+    console.log('[CRP-STREAM] demo runner finished.');
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[CRP-STREAM] demo runner failed:', err);
+  }
 }
 
-// Allow ts-node direct execution
+// Allow `ts-node src/worker/main.ts` to run the demo directly.
 if (require.main === module) {
-  // eslint-disable-next-line no-console
-  main().catch((err) => {
-    console.error("[CRP-STREAM] fatal error in demo runner:", err);
-    process.exitCode = 1;
-  });
+  // eslint-disable-next-line @typescript-eslint/no-floating-promises
+  runDemo();
 }
