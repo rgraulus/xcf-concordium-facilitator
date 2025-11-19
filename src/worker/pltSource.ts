@@ -1,68 +1,121 @@
-/**
- * PLT event streaming abstractions for the CRP worker.
- *
- * Step 1: we provide a FakePltEventSource that generates deterministic
- * in-memory events so we can exercise the worker loop without depending
- * on Concordium gRPC.
- *
- * Step 2 (later): we can add a RealPltEventSource that talks to the
- * Concordium node / PLT contracts and implement this same interface.
- */
+// src/worker/pltSource.ts
 
+/**
+ * Minimal PLT event shape used by the CRP stream worker.
+ * In the real implementation this will be backed by Concordium gRPC
+ * and contain the full decoded PLT event payload.
+ */
 export interface PltEvent {
+  /** Monotonic block / event height on the rail. */
   height: number;
+
+  /** Transaction hash or event identifier. */
   txHash: string;
-  // Later we can add more fields: contract address, tokenId, amount, etc.
+
+  /** PLT token identifier for this event (e.g. "usd:test"). */
+  tokenId: string;
+
+  /** Amount in human-readable units (for demo purposes). */
+  amount: string;
+
+  /** Optional from/to fields to hint at transfer direction. */
+  from?: string;
+  to?: string;
 }
 
-export interface PltEventSourceConfig {
+/**
+ * Abstract source of PLT events.
+ *
+ * The stream worker only depends on this interface; concrete
+ * implementations can be:
+ * - A demo / fake source (in-memory events).
+ * - A real Concordium gRPC v2 PLT event stream.
+ */
+export interface PltEventSource {
+  /**
+   * Fetch all PLT events strictly above the given height.
+   *
+   * Implementations should:
+   * - Return events ordered by ascending height.
+   * - Never return events with height <= lastHeight.
+   */
+  fetchSince(lastHeight: number): Promise<PltEvent[]>;
+}
+
+/**
+ * Configuration for the demo / fake PLT event source.
+ */
+export interface DemoPltSourceConfig {
+  /** Network identifier, e.g. "concordium:testnet". */
   network: string;
+
+  /** PLT token identifier, e.g. "usd:test". */
   tokenId: string;
 }
 
 /**
- * Abstract interface for "something that can fetch PLT events
- * above a given finalized height".
- */
-export interface PltEventSource {
-  /**
-   * Fetch events strictly above the given height.
-   *
-   * Implementations should:
-   * - Only return finalized / safe events.
-   * - Be idempotent: calling with the same height twice should
-   *   return the same events.
-   */
-  fetchEventsAboveHeight(lastHeight: number): Promise<PltEvent[]>;
-}
-
-/**
- * Very small in-memory fake event source for development / testing.
+ * Simple in-memory demo implementation of PltEventSource.
  *
- * It will:
- * - Start at height 1
- * - Emit a single event per tick up to MAX_FAKE_HEIGHT
- * - Then return an empty array
+ * This is only used for local development and CI — it does NOT
+ * talk to Concordium. It returns a fixed sequence of fake events
+ * and logs what it is doing.
  */
 export class FakePltEventSource implements PltEventSource {
-  private readonly maxFakeHeight = 3;
+  private readonly cfg: DemoPltSourceConfig;
+  private readonly events: PltEvent[];
 
-  constructor(private readonly cfg: PltEventSourceConfig) {}
+  constructor(cfg: DemoPltSourceConfig) {
+    this.cfg = cfg;
 
-  async fetchEventsAboveHeight(lastHeight: number): Promise<PltEvent[]> {
-    const nextHeight = lastHeight + 1;
-
-    if (nextHeight > this.maxFakeHeight) {
-      return [];
-    }
-
-    const txHash = `fake-tx-${String(nextHeight).padStart(4, "0")}`;
-
-    return [
+    // For now we hard-code three fake events. The worker’s job is to
+    // prove it can iterate, update lastHeight, and log with decimals.
+    this.events = [
       {
-        height: nextHeight,
-        txHash,
+        height: 1,
+        txHash: 'fake-tx-0001',
+        tokenId: cfg.tokenId,
+        amount: '10.00',
+        from: 'demo-from-1',
+        to: 'demo-to-1',
+      },
+      {
+        height: 2,
+        txHash: 'fake-tx-0002',
+        tokenId: cfg.tokenId,
+        amount: '5.00',
+        from: 'demo-from-2',
+        to: 'demo-to-2',
+      },
+      {
+        height: 3,
+        txHash: 'fake-tx-0003',
+        tokenId: cfg.tokenId,
+        amount: '25.00',
+        from: 'demo-from-3',
+        to: 'demo-to-3',
       },
     ];
   }
+
+  async fetchSince(lastHeight: number): Promise<PltEvent[]> {
+    const result = this.events.filter((ev) => ev.height > lastHeight);
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[CRP-STREAM][demo-source] fetchSince(lastHeight=${lastHeight}) -> ${result.length} event(s)`
+    );
+
+    return result;
+  }
+}
+
+/**
+ * Small factory helper kept for compatibility and readability.
+ * The worker can either call this or construct FakePltEventSource
+ * directly; both are equivalent.
+ */
+export function makeDemoPltEventSource(
+  cfg: DemoPltSourceConfig
+): PltEventSource {
+  return new FakePltEventSource(cfg);
 }

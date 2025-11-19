@@ -1,11 +1,7 @@
 // src/worker/main.ts
 
 import { getPltDecimals, PltAssetKey } from './pltDecimals';
-import {
-  PltEvent,
-  PltEventSource,
-  makeDemoPltEventSource,
-} from './pltSource';
+import { FakePltEventSource } from './pltSource';
 
 export interface WorkerConfig {
   /** How often to poll for new events (ms). */
@@ -50,7 +46,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
 
   // For now we always use the demo source. Later we can switch on an
   // environment variable or config flag to choose a real gRPC source.
-  const source: PltEventSource = makeDemoPltEventSource({ network, tokenId });
+  const source = new FakePltEventSource({ network, tokenId });
 
   // eslint-disable-next-line no-console
   console.log(
@@ -75,7 +71,7 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
   while (running) {
     ticks += 1;
 
-    const events: PltEvent[] = await source.fetchSince(lastHeight);
+    const events = await source.fetchSince(lastHeight);
 
     // eslint-disable-next-line no-console
     console.log(
