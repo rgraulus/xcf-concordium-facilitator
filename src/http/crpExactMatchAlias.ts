@@ -1,84 +1,162 @@
 // src/http/crpExactMatchAlias.ts
 //
-// Simple alias/stub endpoint for an "exact-tuple" CRP payment match.
-// Registered under the /v1/crp prefix by src/server.ts, so the full
-// path is: POST /v1/crp/payments/exact-match
+// Thin GET alias for the existing exact-tuple match logic in
+// POST /v1/crp/payments/match.
 //
-// For now this does not call into internal CRP services; it simply
-// validates the request shape and echoes it back in a stable JSON
-// envelope. This keeps the wiring safe and future-proof.
+// Route (with /v1/crp prefix from server.ts):
+//   GET /v1/crp/payments/exact-match
+//
+// Query parameters (we accept BOTH camelCase and snake_case):
+//
+//   merchantId | merchant_id   (required)
+//   nonce                      (required)
+//   network                    (required)
+//   tokenId   | token_id       (required)
+//   amount                     (required, e.g. "25.00")
+//   payTo     | pay_to         (required)
+//   decimals                   (optional; defaults to 2)
+//   assetType                  (optional; defaults to "PLT")
+//
+// Response shape mirrors POST /v1/crp/payments/match:
+//
+//   200 OK
+//   - on success:
+//       { ok: true, reason: "exact_match", count: 1, match: {...} }
+//   - on no match:
+//       { ok: false, reason: "no_match", count: 0 }
+//   - on bad request:
+//       400 + { ok: false, reason: "bad_request", error: "..." }
 
-import { FastifyPluginCallback } from "fastify";
+import type { FastifyPluginCallback } from "fastify";
+import {
+  searchPayments,
+  type PaymentSearchFilters,
+} from "../store/match.pg";
 
-export interface ExactMatchRequestBody {
+// Narrow helper: best-effort string extraction.
+function asTrimmedString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+// Helper: parse decimals (NaN if useless).
+function asNumberOrNaN(value: unknown): number {
+  if (value === undefined || value === null) return NaN;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+// Our internal representation of the tuple we want to match.
+interface ExactMatchInput {
   merchantId: string;
-  network: string; // e.g. "concordium:testnet"
-  tokenId: string; // e.g. "usd:test"
-  payTo: string;   // e.g. "ccd1qexampleaddress"
-  amount: string;  // human-readable decimal string, e.g. "25.00"
-  nonce: string;   // unique payment nonce
+  nonce: string;
+  network: string;
+  tokenId: string;
+  amount: string;
+  payTo: string;
+  assetType: string;
+  decimals: number;
 }
 
-export interface ExactMatchAliasResponse {
-  ok: boolean;
-  kind: "crp.exact-match.alias.demo";
-  request: ExactMatchRequestBody;
-  notes: string[];
-}
+const crpExactMatchAliasPlugin: FastifyPluginCallback = async (server) => {
+  server.get("/payments/exact-match", async (req, reply) => {
+    const q = (req.query || {}) as Record<string, unknown>;
 
-const crpExactMatchAliasPlugin: FastifyPluginCallback = (fastify, _opts, done) => {
-  // Simple ping route so we can prove the plugin is mounted:
-  fastify.get("/payments/exact-match/ping", async () => ({
-    ok: true,
-    kind: "crp.exact-match.alias.ping",
-  }));
+    // Accept camelCase and snake_case, prefer camelCase if both exist.
+    const merchantId =
+      asTrimmedString(q.merchantId) || asTrimmedString(q.merchant_id);
 
-  fastify.post<{ Body: ExactMatchRequestBody }>(
-    "/payments/exact-match",
-    async (request, reply)
-      : Promise<ExactMatchAliasResponse | { ok: false; error: string; missing?: string[] }> => {
-      const body = request.body;
+    const nonce = asTrimmedString(q.nonce);
+    const network = asTrimmedString(q.network);
 
-      // Minimal shape validation: all fields must be non-empty strings.
-      const requiredFields: (keyof ExactMatchRequestBody)[] = [
-        "merchantId",
-        "network",
-        "tokenId",
-        "payTo",
-        "amount",
-        "nonce",
-      ];
+    const tokenId =
+      asTrimmedString(q.tokenId) || asTrimmedString(q.token_id);
 
-      const missing = requiredFields.filter((key) => {
-        const v = body?.[key];
-        return typeof v !== "string" || v.trim() === "";
-      });
+    const amount = asTrimmedString(q.amount);
 
-      if (missing.length > 0) {
-        reply.code(400);
-        return {
-          ok: false,
-          error: "Missing or invalid required fields",
-          missing,
-        };
-      }
+    const payTo =
+      asTrimmedString(q.payTo) || asTrimmedString(q.pay_to);
 
-      const notes: string[] = [
-        "This is a demo alias endpoint for exact-tuple matches.",
-        "In a future revision, this will delegate into the internal CRP payment match/fulfill logic.",
-      ];
+    const decimalsRaw = q.decimals;
+    const assetTypeRaw = q.assetType;
 
-      // Happy path: echo the request in a stable envelope.
+    const decimals = !Number.isNaN(asNumberOrNaN(decimalsRaw))
+      ? asNumberOrNaN(decimalsRaw)
+      : 2; // sensible default for demo tokens like usd:test
+
+    const assetType =
+      asTrimmedString(assetTypeRaw) || "PLT";
+
+    const input: ExactMatchInput = {
+      merchantId,
+      nonce,
+      network,
+      tokenId,
+      amount,
+      payTo,
+      assetType,
+      decimals,
+    };
+
+    // Basic validation – same spirit as POST /payments/match.
+    if (
+      !input.merchantId ||
+      !input.nonce ||
+      !input.network ||
+      !input.tokenId ||
+      !input.amount ||
+      !input.payTo ||
+      Number.isNaN(input.decimals)
+    ) {
+      reply.code(400);
       return {
-        ok: true,
-        kind: "crp.exact-match.alias.demo",
-        request: body,
-        notes,
+        ok: false,
+        reason: "bad_request",
+        error:
+          "Missing or invalid required query parameters. Required: merchantId, nonce, network, tokenId, amount, payTo. Optional: decimals, assetType.",
       };
     }
-  );
 
-  done();
+    // Use the same "first narrow by tuple, then in-memory exact match" pattern
+    // as the existing findExactMatch() in src/routes/crp.payments.ts.
+    const filters: PaymentSearchFilters = {
+      merchantId: input.merchantId,
+      network: input.network,
+      tokenId: input.tokenId,
+      payTo: input.payTo,
+      // 100 is plenty for dev/demo and keeps the query bounded.
+      limit: 100,
+    };
+
+    const rows = (await searchPayments(filters)) as any[];
+
+    const match = rows.find((row) => {
+      const asset = row.asset ?? {};
+      return (
+        row.nonce === input.nonce &&
+        row.amount === input.amount &&
+        typeof asset.type === "string" &&
+        typeof asset.tokenId === "string" &&
+        asset.type.trim() === input.assetType &&
+        asset.tokenId.trim() === input.tokenId &&
+        Number(asset.decimals) === Number(input.decimals)
+      );
+    });
+
+    if (!match) {
+      return {
+        ok: false,
+        reason: "no_match",
+        count: 0,
+      };
+    }
+
+    return {
+      ok: true,
+      reason: "exact_match",
+      count: 1,
+      match,
+    };
+  });
 };
 
 export default crpExactMatchAliasPlugin;
