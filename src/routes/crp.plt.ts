@@ -1,62 +1,51 @@
 // src/routes/crp.plt.ts
 //
-// /v1/crp/payments/search
+// /v1/crp/plt/search
 //
-// Search challenges/payments using the tuple:
-//   merchantId, network, tokenId, pay_to, status, limit
+// Search PLT transfers using:
+//   tokenId, to, amountMinor, limit
 //
-// This does *not* yet join against PLT transfers. It simply
-// returns matching challenges from the `challenges` table.
-// Later, once PLT ingestion is wired, we can extend the
-// response to include on-chain match info.
+// Backed by the M3 tables defined in db/migrations/002_m3_stream.sql:
+//   - blocks_finalized
+//   - plt_transfers
+//
+// This does NOT (yet) join back to CRP payments; it’s purely a view
+// on the PLT transfer stream so we can sanity-check M3.
 
 import type { FastifyInstance } from "fastify";
-import {
-  searchPayments,
-  type PaymentSearchFilters,
-} from "../store/match.pg";
+import { searchPltTransfers } from "../store/plt.pg";
 
 export default async function routes(server: FastifyInstance) {
-  server.get("/payments/search", async (req, _reply) => {
+  server.get("/plt/search", async (req, _reply) => {
     const q = (req.query || {}) as any;
 
-    const filters: PaymentSearchFilters = {
-      merchantId:
-        typeof q.merchantId === "string" && q.merchantId.trim() !== ""
-          ? q.merchantId.trim()
-          : undefined,
-      network:
-        typeof q.network === "string" && q.network.trim() !== ""
-          ? q.network.trim()
-          : undefined,
+    const filters = {
       tokenId:
         typeof q.tokenId === "string" && q.tokenId.trim() !== ""
           ? q.tokenId.trim()
           : undefined,
-      payTo:
-        typeof q.payTo === "string" && q.payTo.trim() !== ""
-          ? q.payTo.trim()
+      to:
+        typeof q.to === "string" && q.to.trim() !== ""
+          ? q.to.trim()
           : undefined,
-      status:
-        typeof q.status === "string" && q.status.trim() !== ""
-          ? (q.status.trim() as any)
+      amountMinor:
+        typeof q.amountMinor === "string" && q.amountMinor.trim() !== ""
+          ? q.amountMinor.trim()
           : undefined,
       limit:
-        q.limit !== undefined
+        q.limit !== undefined && q.limit !== null
           ? Number(q.limit)
           : undefined,
     };
 
-    const matches = await searchPayments(filters);
+    const matches = await searchPltTransfers(filters);
 
     return {
       ok: true,
       filters: {
-        merchantId: filters.merchantId,
-        network: filters.network,
         tokenId: filters.tokenId,
-        payTo: filters.payTo,
-        status: filters.status,
+        to: filters.to,
+        amountMinor: filters.amountMinor,
         limit: filters.limit ?? 25,
       },
       matches,
