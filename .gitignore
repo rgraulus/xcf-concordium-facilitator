@@ -16,3 +16,7 @@ payload*.json
 # build output
 dist/
 ed25519.pem
+
+# CRP ↔ Gateway smoke artifacts
+.crp-gateway-raw.json
+.crp-gateway-sample.json
