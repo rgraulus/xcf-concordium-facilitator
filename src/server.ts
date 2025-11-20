@@ -11,15 +11,18 @@ import * as challengesMod from "./routes/challenges";
 import * as crpReadsMod from "./routes/crp.reads";
 import * as crpPaymentsMod from "./routes/crp.payments";
 import * as crpHealthMod from "./routes/crp.health";
+import * as crpPltMod from "./routes/crp.plt";
 
 // New: exact-match alias plugin
 import crpExactMatchAliasPlugin from "./http/crpExactMatchAlias";
 
 // --- Small helper to register either default export or the module itself ---
 function asPlugin(mod: any): FastifyPluginCallback {
-  if (mod && typeof mod.default === "function") return mod.default as FastifyPluginCallback;
+  if (mod && typeof mod.default === "function")
+    return mod.default as FastifyPluginCallback;
   if (typeof mod === "function") return mod as FastifyPluginCallback;
-  if (mod && typeof mod.routes === "function") return mod.routes as FastifyPluginCallback;
+  if (mod && typeof mod.routes === "function")
+    return mod.routes as FastifyPluginCallback;
   throw new Error("Route module is not a Fastify plugin function");
 }
 
@@ -42,6 +45,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   server.register(asPlugin(crpHealthMod), { prefix: "/v1/crp" });
   server.register(asPlugin(crpReadsMod), { prefix: "/v1/crp" });
   server.register(asPlugin(crpPaymentsMod), { prefix: "/v1/crp" });
+  server.register(asPlugin(crpPltMod), { prefix: "/v1/crp" });
 
   // NEW: exact-tuple alias endpoint under the same /v1/crp namespace.
   // We register this one directly (no asPlugin wrapper) to avoid ambiguity.
@@ -53,13 +57,11 @@ export async function buildServer(): Promise<FastifyInstance> {
       { url: req.raw.url, method: req.raw.method },
       "Route not found"
     );
-    reply
-      .code(404)
-      .send({
-        message: `Route ${req.method}:${req.url} not found`,
-        error: "Not Found",
-        statusCode: 404,
-      });
+    reply.code(404).send({
+      message: `Route ${req.method}:${req.url} not found`,
+      error: "Not Found",
+      statusCode: 404,
+    });
   });
 
   return server;
@@ -78,7 +80,9 @@ async function start() {
     if (Array.isArray(addrs)) {
       for (const addr of addrs) {
         server.log.info(
-          `Server listening at http://${(addr as any).address}:${(addr as any).port}`
+          `Server listening at http://${(addr as any).address}:${
+            (addr as any).port
+          }`
         );
       }
     }
