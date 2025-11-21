@@ -1,17 +1,15 @@
 // src/worker/pltSource.concordium.ts
 //
-// Skeleton for a real Concordium-backed PLT event source.
-// This is wired behind CRP_STREAM_SOURCE=concordium, but the actual
-// on-chain integration still needs to be implemented.
+// Concordium-backed PLT event source wiring.
 //
-// The intent is that this file will eventually wrap a client built
-// on top of `@concordium/web-sdk/nodejs`, and expose a simple
-// `fetchPltEventsSince` method.
-//
-// For now, the default client returns an empty array and logs a
-// clear TODO so we don't accidentally think we're on real chain data.
+// This file is wired behind CRP_STREAM_SOURCE=concordium.
+// In this micro-step, we replace the pure stub with a client that
+// actually talks to a Concordium node using @concordium/web-sdk,
+// but we still return [] for PLT events so the rest of the worker
+// semantics remain unchanged.
 
 import type { PltEvent, PltEventSource } from "./pltSource";
+import { credentials } from "@grpc/grpc-js";
 
 /**
  * Minimal config for the Concordium PLT source.
@@ -28,8 +26,8 @@ export interface ConcordiumPltEventSourceConfig {
 /**
  * Client interface that the PLT source depends on.
  *
- * In the real implementation, this will be backed by a Concordium
- * JS SDK client created from `@concordium/web-sdk/nodejs`.
+ * The concrete implementation is backed by a Concordium gRPC client
+ * created from `@concordium/web-sdk/nodejs`, loaded dynamically.
  */
 export interface ConcordiumPltEventClient {
   /**
@@ -44,46 +42,211 @@ export interface ConcordiumPltEventClient {
 }
 
 /**
- * Default stub implementation of the Concordium PLT client.
+ * Internal representation of how we connect to a Concordium node.
+ */
+interface ConcordiumNodeConnectionConfig {
+  address: string;
+  port: number;
+  useTls: boolean;
+}
+
+/**
+ * Parse CONCORDIUM_NODE_URL into a (host, port, useTls) triple.
  *
- * This is where we will later:
- *   - Construct a Concordium gRPC / JSON-RPC client using
- *     `@concordium/web-sdk/nodejs`.
- *   - Filter PLT transfer events for (network, tokenId).
- *   - Map them into the shared PltEvent shape.
+ * Supported forms:
+ *   - "grpc.testnet.concordium.com:20000"
+ *   - "https://grpc.testnet.concordium.com:20000"
+ *   - "http://localhost:9095"
  *
- * Pseudocode for the real client (intentionally commented out so it
- * does NOT affect the build yet):
+ * If parsing fails or the env var is empty, we fall back to Concordium's
+ * public testnet node (TLS).
+ */
+function parseNodeUrl(nodeUrlRaw: string | undefined): ConcordiumNodeConnectionConfig {
+  const fallback: ConcordiumNodeConnectionConfig = {
+    address: "grpc.testnet.concordium.com",
+    port: 20000,
+    useTls: true,
+  };
+
+  const trimmed = nodeUrlRaw?.trim();
+  if (!trimmed) {
+    return fallback;
+  }
+
+  // Case 1: "host:port"
+  const hostPortMatch = trimmed.match(/^([^:/]+):(\d+)$/);
+  if (hostPortMatch) {
+    const [, host, portStr] = hostPortMatch;
+    const port = Number(portStr);
+    if (!Number.isNaN(port) && port > 0) {
+      return {
+        address: host,
+        port,
+        useTls: true,
+      };
+    }
+  }
+
+  // Case 2: full URL, e.g. "https://host:port" or "http://localhost:9095"
+  try {
+    const url = new URL(trimmed);
+    const port =
+      url.port && !Number.isNaN(Number(url.port))
+        ? Number(url.port)
+        : url.protocol === "https:"
+        ? 443
+        : 20000;
+
+    const useTls = url.protocol === "https:";
+    return {
+      address: url.hostname,
+      port,
+      useTls,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Dynamic loader for the ConcordiumGRPCNodeClient from @concordium/web-sdk/nodejs.
  *
- *   // import { JsonRpcClient, HttpProvider } from "@concordium/web-sdk/nodejs";
- *   //
- *   // const provider = new HttpProvider(process.env.CONCORDIUM_NODE_URL!);
- *   // const client = new JsonRpcClient(provider);
- *   //
- *   // Then use client.getBlockInfo / getBlockSummary / getInstanceInfo
- *   // and PLT-specific helpers to decode transfers.
+ * We use a runtime import trick to avoid TypeScript's static module resolution
+ * issues with the ESM-only web-sdk package.
+ */
+let LoadedConcordiumGRPCNodeClient: any | null = null;
+
+async function loadConcordiumGRPCNodeClient(): Promise<any> {
+  if (LoadedConcordiumGRPCNodeClient) {
+    return LoadedConcordiumGRPCNodeClient;
+  }
+
+  const dynamicImport = new Function(
+    "specifier",
+    "return import(specifier)"
+  ) as (s: string) => Promise<any>;
+
+  const nodejsModule = await dynamicImport("@concordium/web-sdk/nodejs");
+  LoadedConcordiumGRPCNodeClient = nodejsModule.ConcordiumGRPCNodeClient;
+
+  if (!LoadedConcordiumGRPCNodeClient) {
+    throw new Error(
+      "Failed to load ConcordiumGRPCNodeClient from @concordium/web-sdk/nodejs"
+    );
+  }
+
+  return LoadedConcordiumGRPCNodeClient;
+}
+
+/**
+ * Default Concordium PLT client implementation.
+ *
+ * For this micro-step, it:
+ *   - Connects to a Concordium node.
+ *   - Calls getTokenList(undefined) to exercise the PLT API.
+ *   - Logs up to 3 token IDs for observability.
+ *
+ * It STILL returns [] as the list of PltEvent, so the worker behavior
+ * is unchanged.
  */
 class DefaultConcordiumPltEventClient implements ConcordiumPltEventClient {
+  private client: any | null = null;
+  private connectionConfig: ConcordiumNodeConnectionConfig | null = null;
+
   constructor(private readonly nodeUrl: string) {}
+
+  /**
+   * Lazily construct the Concordium gRPC client.
+   */
+  private async getOrCreateClient(): Promise<any> {
+    if (this.client) {
+      return this.client;
+    }
+
+    const baseConfig = parseNodeUrl(this.nodeUrl);
+    const insecureEnv = process.env.CONCORDIUM_NODE_INSECURE;
+    const forceInsecure =
+      insecureEnv === "1" || insecureEnv?.toLowerCase() === "true";
+
+    const useTls = forceInsecure ? false : baseConfig.useTls;
+    this.connectionConfig = {
+      ...baseConfig,
+      useTls,
+    };
+
+    const ConcordiumGRPCNodeClient = await loadConcordiumGRPCNodeClient();
+
+    const creds = useTls
+      ? credentials.createSsl()
+      : credentials.createInsecure();
+
+    this.client = new ConcordiumGRPCNodeClient(
+      baseConfig.address,
+      baseConfig.port,
+      creds,
+      { timeout: 15_000 }
+    );
+
+    // eslint-disable-next-line no-console
+    console.log("[CRP-STREAM][concordium] Created ConcordiumGRPCNodeClient", {
+      address: baseConfig.address,
+      port: baseConfig.port,
+      useTls,
+    });
+
+    return this.client;
+  }
 
   async fetchPltEventsSince(
     lastHeight: number,
     cfg: ConcordiumPltEventSourceConfig
   ): Promise<PltEvent[]> {
-    // eslint-disable-next-line no-console
-    console.warn(
-      "[CRP-STREAM][concordium] DefaultConcordiumPltEventClient is a stub. " +
-        "No real chain data is being read yet.",
-      {
-        nodeUrl: this.nodeUrl,
-        network: cfg.network,
-        tokenId: cfg.tokenId,
-        lastHeight,
-      }
-    );
+    const client = await this.getOrCreateClient();
 
-    // TODO (M3+): Implement real PLT scanning using @concordium/web-sdk/nodejs
-    // and return a list of PltEvent objects mapped from on-chain transfers.
+    try {
+      // Hit the PLT API by fetching the current PLT list at the latest finalized block.
+      const stream = await client.getTokenList(undefined);
+
+      const sampleTokens: string[] = [];
+      let count = 0;
+      for await (const token of stream) {
+        // TokenId supports toString(); we treat it as any.
+        sampleTokens.push(String(token));
+        count += 1;
+        if (count >= 3) break;
+      }
+
+      // eslint-disable-next-line no-console
+      console.log("[CRP-STREAM][concordium] getTokenList sample", {
+        network: cfg.network,
+        tokenIdFilter: cfg.tokenId,
+        lastHeight,
+        nodeConnection: this.connectionConfig,
+        sampleCount: sampleTokens.length,
+        sampleTokens,
+      });
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error(
+        "[CRP-STREAM][concordium] Error while querying PLT list",
+        {
+          network: cfg.network,
+          tokenIdFilter: cfg.tokenId,
+          lastHeight,
+          nodeConnection: this.connectionConfig,
+          error:
+            error instanceof Error
+              ? { name: error.name, message: error.message }
+              : error,
+        }
+      );
+    }
+
+    // TODO (next micro-steps):
+    //   - Narrow this to cfg.tokenId via getTokenInfo(TokenId.fromString(cfg.tokenId)).
+    //   - Scan finalized blocks for PLT transfer events and map them to PltEvent.
+    //
+    // For now, keep worker semantics identical to the original stub.
     return [];
   }
 }
@@ -115,15 +278,20 @@ export class ConcordiumPltEventSource implements PltEventSource {
 /**
  * Helper to construct a default ConcordiumPltEventClient from environment.
  *
- * Env vars (proposal):
- *   - CONCORDIUM_NODE_URL   -> e.g. "http://localhost:9095"
+ * Env vars:
+ *   - CONCORDIUM_NODE_URL
+ *       e.g. "grpc.testnet.concordium.com:20000"
+ *            "https://grpc.testnet.concordium.com:20000"
+ *            "http://localhost:9095"
+ *   - CONCORDIUM_NODE_INSECURE
+ *       if set to "1" / "true" → force plaintext (useful for local nodes)
  *
  * We keep this intentionally minimal; additional tuning (timeouts,
  * retries, etc.) can be added later without changing call sites.
  */
 export function createConcordiumPltEventClientFromEnv(): ConcordiumPltEventClient {
   const nodeUrl =
-    process.env.CONCORDIUM_NODE_URL ?? "http://localhost:9095";
+    process.env.CONCORDIUM_NODE_URL ?? "grpc.testnet.concordium.com:20000";
 
   return new DefaultConcordiumPltEventClient(nodeUrl);
 }
