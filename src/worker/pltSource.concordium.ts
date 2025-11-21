@@ -5,8 +5,8 @@
 // on-chain integration still needs to be implemented.
 //
 // The intent is that this file will eventually wrap a client built
-// on top of `@concordium/web-sdk/nodejs` (gRPC v2 / JSON-RPC),
-// and expose a simple `fetchPltEventsSince` method.
+// on top of `@concordium/web-sdk/nodejs`, and expose a simple
+// `fetchPltEventsSince` method.
 //
 // For now, the default client returns an empty array and logs a
 // clear TODO so we don't accidentally think we're on real chain data.
@@ -52,13 +52,14 @@ export interface ConcordiumPltEventClient {
  *   - Filter PLT transfer events for (network, tokenId).
  *   - Map them into the shared PltEvent shape.
  *
- * Pseudocode for the real client (commented out on purpose):
+ * Pseudocode for the real client (intentionally commented out so it
+ * does NOT affect the build yet):
  *
- *   import { JsonRpcClient, HttpProvider } from "@concordium/web-sdk/nodejs";
- *
- *   const provider = new HttpProvider(process.env.CONCORDIUM_NODE_URL!);
- *   const client = new JsonRpcClient(provider);
- *
+ *   // import { JsonRpcClient, HttpProvider } from "@concordium/web-sdk/nodejs";
+ *   //
+ *   // const provider = new HttpProvider(process.env.CONCORDIUM_NODE_URL!);
+ *   // const client = new JsonRpcClient(provider);
+ *   //
  *   // Then use client.getBlockInfo / getBlockSummary / getInstanceInfo
  *   // and PLT-specific helpers to decode transfers.
  */
