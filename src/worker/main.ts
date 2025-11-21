@@ -3,7 +3,14 @@
 import "dotenv/config";
 import { upsertFinalizedBlock, insertPltTransfers } from "../store/plt.pg";
 import { getPltDecimals, type PltAssetKey } from "./pltDecimals";
-import { FakePltEventSource, type PltEventSource } from "./pltSource";
+import {
+  FakePltEventSource,
+  type PltEventSource,
+} from "./pltSource";
+import {
+  ConcordiumPltEventSource,
+  createConcordiumPltEventClientFromEnv,
+} from "./pltSource.concordium";
 
 export interface WorkerConfig {
   /** How often to poll for new events (ms). */
@@ -44,29 +51,57 @@ function humanToMinor(amount: string, decimals: number): string {
 /**
  * Core worker loop: polls a PLT event source and persists
  * finalized blocks + PLT transfers into the M3 tables.
+ *
+ * Source selection:
+ *   - CRP_STREAM_SOURCE=demo       -> FakePltEventSource
+ *   - CRP_STREAM_SOURCE=concordium -> ConcordiumPltEventSource (stub for now)
+ *   - unset / anything else        -> defaults to "demo"
  */
 export async function runWorker(config: WorkerConfig): Promise<void> {
-  const { pollIntervalMs, network, tokenId, dryRun, maxTicks } = config;
+  const {
+    pollIntervalMs,
+    network,
+    tokenId,
+    dryRun,
+    maxTicks,
+  } = config;
   let { lastHeight } = config;
 
   const assetKey: PltAssetKey = { network, tokenId };
   const decimals = getPltDecimals(assetKey) ?? 0;
 
-  const source: PltEventSource = new FakePltEventSource({ network, tokenId });
+  const sourceKind = (process.env.CRP_STREAM_SOURCE ?? "demo")
+    .toLowerCase()
+    .trim();
+
+  let source: PltEventSource;
+
+  if (sourceKind === "concordium") {
+    const client = createConcordiumPltEventClientFromEnv();
+    source = new ConcordiumPltEventSource(
+      {
+        network,
+        tokenId,
+        decimals,
+      },
+      client
+    );
+  } else {
+    // Default: in-memory demo events
+    source = new FakePltEventSource({ network, tokenId });
+  }
 
   // eslint-disable-next-line no-console
-  console.log(
-    "[CRP-STREAM] starting worker with config:",
-    {
-      pollIntervalMs,
-      network,
-      tokenId,
-      dryRun,
-      lastHeight,
-      maxTicks,
-      decimals,
-    }
-  );
+  console.log("[CRP-STREAM] starting worker with config:", {
+    pollIntervalMs,
+    network,
+    tokenId,
+    dryRun,
+    lastHeight,
+    maxTicks,
+    decimals,
+    sourceKind,
+  });
 
   let ticks = 0;
   let running = true;
@@ -133,16 +168,13 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
       ]);
 
       // eslint-disable-next-line no-console
-      console.log(
-        "[CRP-STREAM] processed PLT event:",
-        {
-          height: ev.height,
-          txHash: ev.txHash,
-          blockHash: block.block_hash,
-          amountMinor,
-          inserted,
-        }
-      );
+      console.log("[CRP-STREAM] processed PLT event:", {
+        height: ev.height,
+        txHash: ev.txHash,
+        blockHash: block.block_hash,
+        amountMinor,
+        inserted,
+      });
     }
 
     if (typeof maxTicks === "number" && ticks >= maxTicks) {
@@ -168,22 +200,32 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
 /**
  * Demo runner that constructs a WorkerConfig with sensible defaults
  * and runs the worker for a few ticks.
+ *
+ * Env overrides:
+ *   CRP_STREAM_POLL_MS
+ *   CRP_STREAM_NETWORK
+ *   CRP_STREAM_TOKEN_ID
+ *   CRP_STREAM_DRY_RUN        ("1" or "true")
+ *   CRP_STREAM_START_HEIGHT
+ *   CRP_STREAM_MAX_TICKS
+ *   CRP_STREAM_SOURCE         ("demo" | "concordium")
  */
 export async function runDemo(): Promise<void> {
   const demoConfig: WorkerConfig = {
-    pollIntervalMs: 1000,
-    network: "concordium:testnet",
-    tokenId: "usd:test",
-    dryRun: false, // set to true if you want logs-only
-    lastHeight: 0,
-    maxTicks: 3,
+    pollIntervalMs: Number(process.env.CRP_STREAM_POLL_MS ?? "1000"),
+    network: process.env.CRP_STREAM_NETWORK ?? "concordium:testnet",
+    tokenId: process.env.CRP_STREAM_TOKEN_ID ?? "usd:test",
+    dryRun:
+      process.env.CRP_STREAM_DRY_RUN === "1" ||
+      process.env.CRP_STREAM_DRY_RUN === "true",
+    lastHeight: Number(process.env.CRP_STREAM_START_HEIGHT ?? "0"),
+    maxTicks: process.env.CRP_STREAM_MAX_TICKS
+      ? Number(process.env.CRP_STREAM_MAX_TICKS)
+      : 3,
   };
 
   // eslint-disable-next-line no-console
-  console.log(
-    "[CRP-STREAM] demo runner starting with config:",
-    demoConfig
-  );
+  console.log("[CRP-STREAM] demo runner starting with config:", demoConfig);
 
   try {
     await runWorker(demoConfig);
@@ -196,7 +238,7 @@ export async function runDemo(): Promise<void> {
   }
 }
 
-// Allow `ts-node src/worker/main.ts` to run the demo directly.
+// Allow `ts-node src/worker/main.ts` or `npm run crp:worker:demo` to run the demo.
 if (require.main === module) {
   // eslint-disable-next-line @typescript-eslint/no-floating-promises
   runDemo();
