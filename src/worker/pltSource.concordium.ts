@@ -1,18 +1,27 @@
 // src/worker/pltSource.concordium.ts
 //
-// Concordium-backed PLT event source wiring.
+// Concordium-backed PLT event source.
 //
-// This file is wired behind CRP_STREAM_SOURCE=concordium.
-// In this micro-step, we use @concordium/web-sdk via a dynamic loader to:
-//   - Connect to a Concordium node (testnet by default).
-//   - Query PLT token metadata (getTokenList).
-//   - Probe transaction events from the latest finalized block
-//     (getBlockTransactionEvents).
+// Step 1 goal:
+//   - Connect to a Concordium node via gRPC (ConcordiumGRPCNodeClient).
+//   - Inspect the latest finalized block's transaction events.
+//   - Extract TokenUpdateSummary -> TokenTransferEvent for a single PLT token.
+//   - Map those into our internal PltEvent[] shape.
 //
-// IMPORTANT:
-// - We DO talk to a real Concordium node now.
-// - We STILL return [] for PLT events, so the worker/DB semantics
-//   are unchanged for now.
+// Design notes:
+//   - We deliberately keep this "latest block only" for now. That is
+//     enough to prove end-to-end, read-only detection on real chain
+//     data. Later steps can broaden this to a proper height scan.
+//   - We avoid compile-time imports from @concordium/web-sdk/nodejs
+//     to stay friendly with the current tsconfig moduleResolution.
+//     Instead we use dynamic imports + 'any' at the edges.
+//   - We are conservative in our assumptions about the JS-SDK types:
+//
+//       * Block transaction events -> BlockItemSummaryInBlock-like.
+//       * TokenUpdateSummary has { transactionType: "TokenUpdate", events }.
+//       * TokenTransferEvent has { tag: "TokenTransfer", tokenId, amount, from, to }.
+//
+//     Where structure is uncertain, we log and fail soft (skip), not hard.
 
 import type { PltEvent, PltEventSource } from "./pltSource";
 import { credentials } from "@grpc/grpc-js";
@@ -32,8 +41,7 @@ export interface ConcordiumPltEventSourceConfig {
 /**
  * Client interface that the PLT source depends on.
  *
- * The concrete implementation is backed by a Concordium gRPC client
- * created from `@concordium/web-sdk/nodejs`, loaded dynamically.
+ * The real implementation is backed by a Concordium gRPC client.
  */
 export interface ConcordiumPltEventClient {
   /**
@@ -48,260 +56,341 @@ export interface ConcordiumPltEventClient {
 }
 
 /**
- * Internal representation of how we connect to a Concordium node.
+ * Internal helper describing the parsed gRPC node connection.
  */
-interface ConcordiumNodeConnectionConfig {
+interface ConcordiumNodeConnection {
   address: string;
   port: number;
   useTls: boolean;
 }
 
 /**
- * Parse CONCORDIUM_NODE_URL into a (host, port, useTls) triple.
+ * Parse CONCORDIUM_NODE_URL into (address, port, useTls).
  *
  * Supported forms:
- *   - "grpc.testnet.concordium.com:20000"
- *   - "https://grpc.testnet.concordium.com:20000"
- *   - "http://localhost:9095"
- *
- * If parsing fails or the env var is empty, we fall back to Concordium's
- * public testnet node (TLS).
+ *   - "localhost:9095"         (no TLS)
+ *   - "grpc.testnet.concordium.com:20000" (TLS)
+ *   - "http://localhost:9095"  (no TLS)
+ *   - "https://example.com:443" (TLS)
  */
-function parseNodeUrl(nodeUrlRaw: string | undefined): ConcordiumNodeConnectionConfig {
-  const fallback: ConcordiumNodeConnectionConfig = {
-    address: "grpc.testnet.concordium.com",
-    port: 20000,
-    useTls: true,
-  };
-
-  const trimmed = nodeUrlRaw?.trim();
-  if (!trimmed) {
-    return fallback;
-  }
-
-  // Case 1: "host:port"
-  const hostPortMatch = trimmed.match(/^([^:/]+):(\d+)$/);
-  if (hostPortMatch) {
-    const [, host, portStr] = hostPortMatch;
-    const port = Number(portStr);
-    if (!Number.isNaN(port) && port > 0) {
-      return {
-        address: host,
-        port,
-        useTls: true,
-      };
-    }
-  }
-
-  // Case 2: full URL, e.g. "https://host:port" or "http://localhost:9095"
-  try {
-    const url = new URL(trimmed);
+function parseNodeUrl(raw: string): ConcordiumNodeConnection {
+  // If it looks like it has a scheme, go through URL.
+  if (raw.includes("://")) {
+    const url = new URL(raw);
     const port =
-      url.port && !Number.isNaN(Number(url.port))
+      url.port && url.port.length > 0
         ? Number(url.port)
         : url.protocol === "https:"
         ? 443
-        : 20000;
+        : 80;
 
-    const useTls = url.protocol === "https:";
     return {
       address: url.hostname,
       port,
-      useTls,
+      useTls: url.protocol === "https:",
     };
-  } catch {
-    return fallback;
+  }
+
+  // Otherwise: host[:port] form.
+  const [host, portStr] = raw.split(":");
+  const port = portStr ? Number(portStr) : 20000;
+
+  return {
+    address: host || "localhost",
+    port: Number.isFinite(port) ? port : 20000,
+    // Concordium public gRPC (mainnet/testnet) uses TLS on 20000.
+    useTls: port === 20000,
+  };
+}
+
+// --- Dynamic JS-SDK loading -------------------------------------------------
+
+let ConcordiumGRPCNodeClientCtor: any | undefined;
+let BlockHash: any | undefined;
+let grpcNamespace: any | undefined;
+
+/**
+ * Load the relevant JS-SDK pieces via dynamic import.
+ *
+ * This keeps the TypeScript compile happy even though the
+ * @concordium/web-sdk nodejs entrypoint uses ESM under the hood.
+ */
+async function loadConcordiumSdkModules() {
+  if (!ConcordiumGRPCNodeClientCtor) {
+    const dynamicImport = new Function(
+      "specifier",
+      "return import(specifier)"
+    ) as (specifier: string) => Promise<any>;
+
+    const nodejsModule = await dynamicImport("@concordium/web-sdk/nodejs");
+    ConcordiumGRPCNodeClientCtor = nodejsModule.ConcordiumGRPCNodeClient;
+  }
+
+  if (!BlockHash || !grpcNamespace) {
+    const dynamicImport = new Function(
+      "specifier",
+      "return import(specifier)"
+    ) as (specifier: string) => Promise<any>;
+
+    const webSdkModule = await dynamicImport("@concordium/web-sdk");
+    // BlockHash type helper + grpc namespace with isKnown/knownOrError.
+    BlockHash = webSdkModule.BlockHash;
+    grpcNamespace = webSdkModule.grpc ?? webSdkModule;
   }
 }
 
 /**
- * Dynamic loader for the ConcordiumGRPCNodeClient from @concordium/web-sdk/nodejs.
+ * Real Concordium-backed implementation of the PLT event client.
  *
- * We use a runtime import trick to avoid TypeScript's static module resolution
- * issues with the ESM-only web-sdk package.
+ * For Step 1 we:
+ *   - Find the latest finalized block (via getBlockInfo()).
+ *   - If its height <= lastHeight: return [].
+ *   - Otherwise:
+ *       * Fetch its transaction events (getBlockTransactionEvents).
+ *       * Filter TokenUpdateSummary items.
+ *       * Inside those, filter TokenTransferEvent for our PLT token.
+ *       * Map to PltEvent[] with height = blockHeight.
  */
-let LoadedConcordiumGRPCNodeClient: any | null = null;
+class ConcordiumGrpcPltEventClient implements ConcordiumPltEventClient {
+  private readonly nodeUrl: string;
 
-async function loadConcordiumGRPCNodeClient(): Promise<any> {
-  if (LoadedConcordiumGRPCNodeClient) {
-    return LoadedConcordiumGRPCNodeClient;
-  }
-
-  const dynamicImport = new Function(
-    "specifier",
-    "return import(specifier)"
-  ) as (s: string) => Promise<any>;
-
-  const nodejsModule = await dynamicImport("@concordium/web-sdk/nodejs");
-  LoadedConcordiumGRPCNodeClient = nodejsModule.ConcordiumGRPCNodeClient;
-
-  if (!LoadedConcordiumGRPCNodeClient) {
-    throw new Error(
-      "Failed to load ConcordiumGRPCNodeClient from @concordium/web-sdk/nodejs"
-    );
-  }
-
-  return LoadedConcordiumGRPCNodeClient;
-}
-
-/**
- * Default Concordium PLT client implementation.
- *
- * For this micro-step, it:
- *   - Connects to a Concordium node.
- *   - Calls getTokenList(undefined) to exercise the PLT API and logs
- *     a small sample of token IDs.
- *   - Calls getBlockTransactionEvents() to probe transaction events
- *     in the latest finalized block and logs a small sample.
- *
- * It STILL returns [] as the list of PltEvent, so the worker behavior
- * is unchanged.
- */
-class DefaultConcordiumPltEventClient implements ConcordiumPltEventClient {
-  private client: any | null = null;
-  private connectionConfig: ConcordiumNodeConnectionConfig | null = null;
-
-  constructor(private readonly nodeUrl: string) {}
-
-  /**
-   * Lazily construct the Concordium gRPC client.
-   */
-  private async getOrCreateClient(): Promise<any> {
-    if (this.client) {
-      return this.client;
-    }
-
-    const baseConfig = parseNodeUrl(this.nodeUrl);
-    const insecureEnv = process.env.CONCORDIUM_NODE_INSECURE;
-    const forceInsecure =
-      insecureEnv === "1" || insecureEnv?.toLowerCase() === "true";
-
-    const useTls = forceInsecure ? false : baseConfig.useTls;
-    this.connectionConfig = {
-      ...baseConfig,
-      useTls,
-    };
-
-    const ConcordiumGRPCNodeClient = await loadConcordiumGRPCNodeClient();
-
-    const creds = useTls
-      ? credentials.createSsl()
-      : credentials.createInsecure();
-
-    this.client = new ConcordiumGRPCNodeClient(
-      baseConfig.address,
-      baseConfig.port,
-      creds,
-      { timeout: 15_000 }
-    );
-
-    // eslint-disable-next-line no-console
-    console.log("[CRP-STREAM][concordium] Created ConcordiumGRPCNodeClient", {
-      address: baseConfig.address,
-      port: baseConfig.port,
-      useTls,
-    });
-
-    return this.client;
+  constructor(nodeUrl: string) {
+    this.nodeUrl = nodeUrl;
   }
 
   async fetchPltEventsSince(
     lastHeight: number,
     cfg: ConcordiumPltEventSourceConfig
   ): Promise<PltEvent[]> {
-    const client = await this.getOrCreateClient();
+    await loadConcordiumSdkModules();
 
-    //
-    // 1) Probe PLT token list (already working from previous step)
-    //
-    try {
-      const stream = await client.getTokenList(undefined);
+    const { address, port, useTls } = parseNodeUrl(this.nodeUrl);
 
-      const sampleTokens: string[] = [];
-      let count = 0;
-      for await (const token of stream) {
-        sampleTokens.push(String(token));
-        count += 1;
-        if (count >= 3) break;
-      }
+    // eslint-disable-next-line no-console
+    console.log("[CRP-STREAM][concordium] Using node connection", {
+      nodeUrl: this.nodeUrl,
+      parsed: { address, port, useTls },
+      network: cfg.network,
+      logicalTokenId: cfg.tokenId,
+      lastHeight,
+    });
 
+    if (!ConcordiumGRPCNodeClientCtor || !BlockHash || !grpcNamespace) {
       // eslint-disable-next-line no-console
-      console.log("[CRP-STREAM][concordium] getTokenList sample", {
-        network: cfg.network,
-        tokenIdFilter: cfg.tokenId,
-        lastHeight,
-        nodeConnection: this.connectionConfig,
-        sampleCount: sampleTokens.length,
-        sampleTokens,
-      });
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error(
-        "[CRP-STREAM][concordium] Error while querying PLT list",
-        {
-          network: cfg.network,
-          tokenIdFilter: cfg.tokenId,
-          lastHeight,
-          nodeConnection: this.connectionConfig,
-          error:
-            error instanceof Error
-              ? { name: error.name, message: error.message }
-              : error,
-        }
+      console.warn(
+        "[CRP-STREAM][concordium] Concordium JS-SDK modules not loaded; returning no events."
       );
+      return [];
     }
 
-    //
-    // 2) NEW: Probe transaction events on the latest finalized block.
-    //    This uses getBlockTransactionEvents() with no block hash,
-    //    which defaults to the last finalized block on the node.
-    //
+    const creds = useTls
+      ? credentials.createSsl()
+      : credentials.createInsecure();
+
+    const client = new ConcordiumGRPCNodeClientCtor(address, port, creds);
+
+    // 1) Get latest finalized block info.
+    let blockInfo: any;
     try {
-      const eventsStream = client.getBlockTransactionEvents();
+      blockInfo = await client.getBlockInfo();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[CRP-STREAM][concordium] Error while querying latest block info",
+        {
+          error: err,
+        }
+      );
+      return [];
+    }
 
-      const sampleEvents: any[] = [];
-      let count = 0;
-      for await (const ev of eventsStream) {
-        sampleEvents.push(ev);
-        count += 1;
-        if (count >= 3) break;
-      }
+    const rawHeight = blockInfo?.blockHeight;
+    const blockHeight =
+      typeof rawHeight === "bigint" ? Number(rawHeight) : Number(rawHeight);
 
+    if (!Number.isFinite(blockHeight)) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[CRP-STREAM][concordium] Latest block height is not a finite number; returning no events.",
+        { rawHeight }
+      );
+      return [];
+    }
+
+    // Short-circuit if we have already processed this or a later block.
+    if (blockHeight <= lastHeight) {
       // eslint-disable-next-line no-console
       console.log(
-        "[CRP-STREAM][concordium] getBlockTransactionEvents sample",
-        {
-          network: cfg.network,
-          tokenIdFilter: cfg.tokenId,
-          lastHeight,
-          nodeConnection: this.connectionConfig,
-          sampleCount: sampleEvents.length,
-          sampleEvents,
-        }
+        "[CRP-STREAM][concordium] No new blocks since lastHeight; skipping.",
+        { lastHeight, blockHeight }
       );
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error(
-        "[CRP-STREAM][concordium] Error while querying block transaction events",
-        {
-          network: cfg.network,
-          tokenIdFilter: cfg.tokenId,
-          lastHeight,
-          nodeConnection: this.connectionConfig,
-          error:
-            error instanceof Error
-              ? { name: error.name, message: error.message }
-              : error,
-        }
-      );
+      return [];
     }
 
-    // TODO (next micro-steps):
-    //   - Narrow down to PLT TokenTransferEvent events for cfg.tokenId.
-    //   - Map them into PltEvent objects and return them.
-    //
-    // For now, keep worker semantics identical to the original stub.
-    return [];
+    const blockHashObj = blockInfo.blockHash;
+    const blockHash =
+      blockHashObj && typeof blockHashObj.toString === "function"
+        ? blockHashObj.toString()
+        : String(blockHashObj ?? "");
+
+    // 2) Fetch transaction events for this block only.
+    let txEventStream: AsyncIterable<any>;
+    try {
+      const bh = blockHash
+        ? BlockHash.fromHexString
+          ? BlockHash.fromHexString(blockHash)
+          : blockHash
+        : undefined;
+
+      txEventStream = bh
+        ? client.getBlockTransactionEvents(bh)
+        : client.getBlockTransactionEvents();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[CRP-STREAM][concordium] Error while creating tx-event stream",
+        {
+          error: err,
+          blockHash,
+        }
+      );
+      return [];
+    }
+
+    const isKnown =
+      typeof grpcNamespace.isKnown === "function"
+        ? grpcNamespace.isKnown.bind(grpcNamespace)
+        : undefined;
+
+    const filterTokenId =
+      process.env.CONCORDIUM_PLT_TOKEN_ID && process.env.CONCORDIUM_PLT_TOKEN_ID.length > 0
+        ? process.env.CONCORDIUM_PLT_TOKEN_ID
+        : cfg.tokenId;
+
+    const results: PltEvent[] = [];
+    const sampleTransactionTypes: string[] = [];
+    const sampleTokenEvents: any[] = [];
+
+    try {
+      for await (const item of txEventStream) {
+        // BlockItemSummaryInBlock-like: { summary, transactionHash, ... }
+        const summary: any = item?.summary ?? item;
+
+        if (!summary) {
+          continue;
+        }
+
+        const txType: string =
+          summary.transactionType ?? summary.type ?? "<unknown>";
+        const txHashVal =
+          item?.transactionHash ??
+          summary.transactionHash ??
+          summary.hash ??
+          undefined;
+        const txHash =
+          txHashVal && typeof txHashVal.toString === "function"
+            ? txHashVal.toString()
+            : String(txHashVal ?? "");
+
+        if (sampleTransactionTypes.length < 5) {
+          sampleTransactionTypes.push(txType);
+        }
+
+        // We're only interested in token updates (TokenUpdateSummary).
+        if (txType !== "TokenUpdate") {
+          continue;
+        }
+
+        const events: any[] = Array.isArray(summary.events)
+          ? summary.events
+          : [];
+
+        for (const rawEv of events) {
+          const ev = isKnown && !isKnown(rawEv) ? undefined : rawEv;
+          if (!ev) {
+            continue;
+          }
+
+          // TokenTransferEvent: { tag: "TokenTransfer", tokenId, amount, from, to, ... }
+          if (ev.tag !== "TokenTransfer") {
+            continue;
+          }
+
+          if (sampleTokenEvents.length < 3) {
+            sampleTokenEvents.push(ev);
+          }
+
+          const tokenIdVal = ev.tokenId;
+          const tokenIdStr =
+            tokenIdVal && typeof tokenIdVal.toString === "function"
+              ? tokenIdVal.toString()
+              : String(tokenIdVal ?? "");
+
+          if (filterTokenId && tokenIdStr !== filterTokenId) {
+            continue;
+          }
+
+          const amountVal = ev.amount;
+          const amountStr =
+            amountVal && typeof amountVal.toString === "function"
+              ? amountVal.toString()
+              : String(amountVal ?? "");
+
+          const fromUp = ev.from;
+          const toUp = ev.to;
+
+          const fromVal = isKnown && !isKnown(fromUp) ? undefined : fromUp;
+          const toVal = isKnown && !isKnown(toUp) ? undefined : toUp;
+
+          const fromStr =
+            fromVal && typeof fromVal.toString === "function"
+              ? fromVal.toString()
+              : fromVal
+              ? JSON.stringify(fromVal)
+              : undefined;
+
+          const toStr =
+            toVal && typeof toVal.toString === "function"
+              ? toVal.toString()
+              : toVal
+              ? JSON.stringify(toVal)
+              : undefined;
+
+          results.push({
+            height: blockHeight,
+            txHash: txHash || `<unknown-${blockHeight}-${results.length}>`,
+            tokenId: cfg.tokenId, // logical token id used by CRP
+            amount: amountStr,
+            from: fromStr,
+            to: toStr,
+          });
+        }
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[CRP-STREAM][concordium] Error while iterating tx-event stream",
+        {
+          error: err,
+          blockHash,
+        }
+      );
+      return [];
+    }
+
+    // Debug samples for introspection.
+    // eslint-disable-next-line no-console
+    console.log("[CRP-STREAM][concordium] getBlockTransactionEvents sample", {
+      network: cfg.network,
+      tokenIdFilter: filterTokenId,
+      blockHash,
+      blockHeight,
+      sampleTransactionTypes,
+      sampleTokenEvents,
+      matchedEvents: results.length,
+    });
+
+    return results;
   }
 }
 
@@ -333,19 +422,15 @@ export class ConcordiumPltEventSource implements PltEventSource {
  * Helper to construct a default ConcordiumPltEventClient from environment.
  *
  * Env vars:
- *   - CONCORDIUM_NODE_URL
- *       e.g. "grpc.testnet.concordium.com:20000"
- *            "https://grpc.testnet.concordium.com:20000"
- *            "http://localhost:9095"
- *   - CONCORDIUM_NODE_INSECURE
- *       if set to "1" / "true" → force plaintext (useful for local nodes)
+ *   - CONCORDIUM_NODE_URL      -> e.g. "grpc.testnet.concordium.com:20000"
+ *   - CONCORDIUM_PLT_TOKEN_ID  -> on-chain PLT token id (e.g. "t-USD"), optional.
  *
- * We keep this intentionally minimal; additional tuning (timeouts,
- * retries, etc.) can be added later without changing call sites.
+ * If CONCORDIUM_PLT_TOKEN_ID is not set, we fall back to cfg.tokenId.
  */
 export function createConcordiumPltEventClientFromEnv(): ConcordiumPltEventClient {
   const nodeUrl =
-    process.env.CONCORDIUM_NODE_URL ?? "grpc.testnet.concordium.com:20000";
+    process.env.CONCORDIUM_NODE_URL ?? "http://localhost:9095";
 
-  return new DefaultConcordiumPltEventClient(nodeUrl);
+  return new ConcordiumGrpcPltEventClient(nodeUrl);
 }
+
