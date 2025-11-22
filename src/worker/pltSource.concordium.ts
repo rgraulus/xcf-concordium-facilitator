@@ -3,10 +3,16 @@
 // Concordium-backed PLT event source wiring.
 //
 // This file is wired behind CRP_STREAM_SOURCE=concordium.
-// In this micro-step, we replace the pure stub with a client that
-// actually talks to a Concordium node using @concordium/web-sdk,
-// but we still return [] for PLT events so the rest of the worker
-// semantics remain unchanged.
+// In this micro-step, we use @concordium/web-sdk via a dynamic loader to:
+//   - Connect to a Concordium node (testnet by default).
+//   - Query PLT token metadata (getTokenList).
+//   - Probe transaction events from the latest finalized block
+//     (getBlockTransactionEvents).
+//
+// IMPORTANT:
+// - We DO talk to a real Concordium node now.
+// - We STILL return [] for PLT events, so the worker/DB semantics
+//   are unchanged for now.
 
 import type { PltEvent, PltEventSource } from "./pltSource";
 import { credentials } from "@grpc/grpc-js";
@@ -143,8 +149,10 @@ async function loadConcordiumGRPCNodeClient(): Promise<any> {
  *
  * For this micro-step, it:
  *   - Connects to a Concordium node.
- *   - Calls getTokenList(undefined) to exercise the PLT API.
- *   - Logs up to 3 token IDs for observability.
+ *   - Calls getTokenList(undefined) to exercise the PLT API and logs
+ *     a small sample of token IDs.
+ *   - Calls getBlockTransactionEvents() to probe transaction events
+ *     in the latest finalized block and logs a small sample.
  *
  * It STILL returns [] as the list of PltEvent, so the worker behavior
  * is unchanged.
@@ -203,14 +211,15 @@ class DefaultConcordiumPltEventClient implements ConcordiumPltEventClient {
   ): Promise<PltEvent[]> {
     const client = await this.getOrCreateClient();
 
+    //
+    // 1) Probe PLT token list (already working from previous step)
+    //
     try {
-      // Hit the PLT API by fetching the current PLT list at the latest finalized block.
       const stream = await client.getTokenList(undefined);
 
       const sampleTokens: string[] = [];
       let count = 0;
       for await (const token of stream) {
-        // TokenId supports toString(); we treat it as any.
         sampleTokens.push(String(token));
         count += 1;
         if (count >= 3) break;
@@ -242,9 +251,54 @@ class DefaultConcordiumPltEventClient implements ConcordiumPltEventClient {
       );
     }
 
+    //
+    // 2) NEW: Probe transaction events on the latest finalized block.
+    //    This uses getBlockTransactionEvents() with no block hash,
+    //    which defaults to the last finalized block on the node.
+    //
+    try {
+      const eventsStream = client.getBlockTransactionEvents();
+
+      const sampleEvents: any[] = [];
+      let count = 0;
+      for await (const ev of eventsStream) {
+        sampleEvents.push(ev);
+        count += 1;
+        if (count >= 3) break;
+      }
+
+      // eslint-disable-next-line no-console
+      console.log(
+        "[CRP-STREAM][concordium] getBlockTransactionEvents sample",
+        {
+          network: cfg.network,
+          tokenIdFilter: cfg.tokenId,
+          lastHeight,
+          nodeConnection: this.connectionConfig,
+          sampleCount: sampleEvents.length,
+          sampleEvents,
+        }
+      );
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error(
+        "[CRP-STREAM][concordium] Error while querying block transaction events",
+        {
+          network: cfg.network,
+          tokenIdFilter: cfg.tokenId,
+          lastHeight,
+          nodeConnection: this.connectionConfig,
+          error:
+            error instanceof Error
+              ? { name: error.name, message: error.message }
+              : error,
+        }
+      );
+    }
+
     // TODO (next micro-steps):
-    //   - Narrow this to cfg.tokenId via getTokenInfo(TokenId.fromString(cfg.tokenId)).
-    //   - Scan finalized blocks for PLT transfer events and map them to PltEvent.
+    //   - Narrow down to PLT TokenTransferEvent events for cfg.tokenId.
+    //   - Map them into PltEvent objects and return them.
     //
     // For now, keep worker semantics identical to the original stub.
     return [];
