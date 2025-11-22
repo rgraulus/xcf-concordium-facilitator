@@ -18,6 +18,7 @@
     "smoke:plt:concordium": "bash scripts/smoke-crp-plt-concordium.sh",
     "smoke:plt:concordium:write": "bash scripts/smoke-crp-plt-concordium-write.sh",
     "smoke:plt:http": "bash scripts/smoke-crp-plt-http.sh",
+    "smoke:crp:match-exact": "bash scripts/smoke-crp-payments-exact-match.sh",
     "crp:worker:demo": "ts-node src/worker/main.ts",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:ci": "echo \"No tests yet (CI)\" && exit 0"
