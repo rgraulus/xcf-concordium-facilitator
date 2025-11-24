@@ -16,6 +16,9 @@ import * as crpPltMod from "./routes/crp.plt";
 // New: exact-match alias plugin
 import crpExactMatchAliasPlugin from "./http/crpExactMatchAlias";
 
+// New: readiness endpoint plugin (/readyz)
+import readyzPlugin from "./http/readyz";
+
 // --- Small helper to register either default export or the module itself ---
 function asPlugin(mod: any): FastifyPluginCallback {
   if (mod && typeof mod.default === "function")
@@ -34,6 +37,9 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   // --- Basic liveness ---
   server.get("/healthz", async () => ({ ok: true }));
+
+  // --- Readiness (/readyz) – checks DB connectivity ---
+  server.register(readyzPlugin);
 
   // --- Core routes (no prefix) ---
   server.register(asPlugin(jwksMod));
