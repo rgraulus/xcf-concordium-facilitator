@@ -20,3 +20,6 @@ ed25519.pem
 # CRP ↔ Gateway smoke artifacts
 .crp-gateway-raw.json
 .crp-gateway-sample.json
+
+# local private keys / wallet exports (never commit)
+keys/
