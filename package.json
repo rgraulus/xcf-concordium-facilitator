@@ -21,6 +21,10 @@
     "smoke:plt:http": "bash scripts/smoke-crp-plt-http.sh",
     "smoke:crp:match-exact": "bash scripts/smoke-crp-payments-exact-match.sh",
     "crp:worker:demo": "ts-node src/worker/main.ts",
+    "debug:plt:db": "ts-node src/tools/debugPltDb.ts",
+    "migration:apply:plt": "ts-node src/tools/applyCrpPltEventsMigration.ts",
+    "debug:plt:stream": "ts-node src/tools/debugPltStreamConfig.ts",
+    "debug:tx:summary": "ts-node src/tools/debugTxSummary.ts",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:ci": "echo \"No tests yet (CI)\" && exit 0"
   },

@@ -19,7 +19,7 @@ export interface WorkerConfig {
   /** Network identifier, e.g. "concordium:testnet". */
   network: string;
 
-  /** PLT token identifier, e.g. "usd:test". */
+  /** PLT token identifier, e.g. "usd:test" or "EUDemo". */
   tokenId: string;
 
   /** If true, do not persist anything; just log. */
@@ -54,21 +54,61 @@ function humanToMinor(amount: string, decimals: number): string {
  *
  * Source selection:
  *   - CRP_STREAM_SOURCE=demo       -> FakePltEventSource
- *   - CRP_STREAM_SOURCE=concordium -> ConcordiumPltEventSource (stub for now)
+ *   - CRP_STREAM_SOURCE=concordium -> ConcordiumPltEventSource
  *   - unset / anything else        -> defaults to "demo"
+ *
+ * Token selection (within this worker):
+ *   - CONCORDIUM_PLT_TOKEN_ID      -> highest precedence
+ *   - CRP_STREAM_TOKEN_ID          -> fallback
+ *   - "usd:test"                   -> default
+ *
+ * Decimals selection:
+ *   - CONCORDIUM_PLT_DECIMALS      -> highest precedence (if numeric)
+ *   - getPltDecimals({network,tokenId}) -> registry fallback
+ *   - 0                            -> final fallback
  */
 export async function runWorker(config: WorkerConfig): Promise<void> {
   const {
     pollIntervalMs,
     network,
-    tokenId,
     dryRun,
     maxTicks,
   } = config;
+
+  // Allow the worker to override the tokenId from env, even if the caller
+  // passed something else (keeps it consistent with debug:plt:stream).
+  const envTokenIdOverride = process.env.CONCORDIUM_PLT_TOKEN_ID;
+  const tokenId =
+    typeof envTokenIdOverride === "string" &&
+    envTokenIdOverride.trim() !== ""
+      ? envTokenIdOverride.trim()
+      : config.tokenId;
+
   let { lastHeight } = config;
 
   const assetKey: PltAssetKey = { network, tokenId };
-  const decimals = getPltDecimals(assetKey) ?? 0;
+
+  // Registry decimals (from our in-memory map).
+  const registryDecimals = getPltDecimals(assetKey);
+
+  // Optional env override for decimals.
+  const envDecimalsRaw = process.env.CONCORDIUM_PLT_DECIMALS;
+  let decimals: number;
+
+  if (
+    typeof envDecimalsRaw === "string" &&
+    envDecimalsRaw.trim() !== "" &&
+    !Number.isNaN(Number(envDecimalsRaw))
+  ) {
+    decimals = Number(envDecimalsRaw);
+  } else if (
+    typeof registryDecimals === "number" &&
+    !Number.isNaN(registryDecimals)
+  ) {
+    decimals = registryDecimals;
+  } else {
+    decimals = 0;
+  }
 
   const sourceKind = (process.env.CRP_STREAM_SOURCE ?? "demo")
     .toLowerCase()
@@ -204,17 +244,27 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
  * Env overrides:
  *   CRP_STREAM_POLL_MS
  *   CRP_STREAM_NETWORK
- *   CRP_STREAM_TOKEN_ID
+ *
+ *   Token id precedence:
+ *     CONCORDIUM_PLT_TOKEN_ID
+ *       -> CRP_STREAM_TOKEN_ID
+ *       -> "usd:test"
+ *
  *   CRP_STREAM_DRY_RUN        ("1" or "true")
  *   CRP_STREAM_START_HEIGHT
  *   CRP_STREAM_MAX_TICKS
  *   CRP_STREAM_SOURCE         ("demo" | "concordium")
  */
 export async function runDemo(): Promise<void> {
+  const envTokenId =
+    process.env.CONCORDIUM_PLT_TOKEN_ID ??
+    process.env.CRP_STREAM_TOKEN_ID ??
+    "usd:test";
+
   const demoConfig: WorkerConfig = {
     pollIntervalMs: Number(process.env.CRP_STREAM_POLL_MS ?? "1000"),
     network: process.env.CRP_STREAM_NETWORK ?? "concordium:testnet",
-    tokenId: process.env.CRP_STREAM_TOKEN_ID ?? "usd:test",
+    tokenId: envTokenId,
     dryRun:
       process.env.CRP_STREAM_DRY_RUN === "1" ||
       process.env.CRP_STREAM_DRY_RUN === "true",
