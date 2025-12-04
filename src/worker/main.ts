@@ -1,138 +1,50 @@
 // src/worker/main.ts
+//
+// M3 CRP stream worker (PLT-focused).
+//
+// This worker polls a PLT source (currently a stubbed Concordium source)
+// and writes normalized PLT transfer events into Postgres via the
+// crp_plt_events table (using src/store/plt.pg.ts).
+//
+// The Concordium integration is intentionally stubbed right now to unblock
+// CI/build without relying on @concordium/web-sdk gRPC wiring. The public
+// interface and logging are designed so we can swap in a real node-backed
+// implementation later without touching callers.
 
-import "dotenv/config";
-import { upsertFinalizedBlock, insertPltTransfers } from "../store/plt.pg";
-import { getPltDecimals, type PltAssetKey } from "./pltDecimals";
-import {
-  FakePltEventSource,
-  type PltEventSource,
-} from "./pltSource";
-import {
-  ConcordiumPltEventSource,
-  createConcordiumPltEventClientFromEnv,
-} from "./pltSource.concordium";
+import { createConcordiumNodeConfigFromEnv, ConcordiumPltSource } from "./pltSource.concordium";
+import { insertPltTransfers, PltTransferInsertInput } from "../store/plt.pg";
 
-export interface WorkerConfig {
-  /** How often to poll for new events (ms). */
+const DEFAULT_POLL_INTERVAL_MS = 1000;
+const DEFAULT_MAX_TICKS = 3;
+const DEFAULT_DECIMALS = 6;
+
+type SourceKind = "concordium";
+
+interface WorkerConfig {
   pollIntervalMs: number;
-
-  /** Network identifier, e.g. "concordium:testnet". */
   network: string;
-
-  /** PLT token identifier, e.g. "usd:test" or "EUDemo". */
   tokenId: string;
-
-  /** If true, do not persist anything; just log. */
   dryRun: boolean;
-
-  /** Last processed height (inclusive). */
   lastHeight: number;
-
-  /** Optional safety cap on the number of polling ticks. */
-  maxTicks?: number;
+  maxTicks: number;
+  decimals: number;
+  sourceKind: SourceKind;
 }
 
 /**
- * Convert a human-readable decimal amount (e.g. "25.00")
- * into integer minor units as a string (e.g. "2500" for 2 decimals).
+ * Read worker configuration from environment variables, with sensible defaults.
  */
-function humanToMinor(amount: string, decimals: number): string {
-  const negative = amount.startsWith("-");
-  const stripped = negative ? amount.slice(1) : amount;
-  const [rawInt, rawFrac = ""] = stripped.split(".");
+function loadWorkerConfigFromEnv(): WorkerConfig {
+  const pollIntervalMs = Number(process.env.CRP_STREAM_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS);
+  const maxTicks = Number(process.env.CRP_STREAM_MAX_TICKS ?? DEFAULT_MAX_TICKS);
+  const tokenId = process.env.CRP_STREAM_TOKEN_ID ?? process.env.CONCORDIUM_PLT_TOKEN_ID ?? "EUDemo";
+  const decimals = Number(process.env.CONCORDIUM_PLT_DECIMALS ?? DEFAULT_DECIMALS);
+  const network = process.env.CRP_STREAM_NETWORK ?? "concordium:testnet";
+  const dryRun = process.env.CRP_STREAM_DRY_RUN === "1" || process.env.CRP_STREAM_DRY_RUN === "true";
+  const lastHeight = Number(process.env.CRP_STREAM_LAST_HEIGHT ?? 0);
+  const sourceKind: SourceKind = (process.env.CRP_STREAM_SOURCE as SourceKind) ?? "concordium";
 
-  const intPart = rawInt.replace(/^0+/, "") || "0";
-  const fracPadded = rawFrac.padEnd(decimals, "0").slice(0, decimals);
-
-  const combined = (intPart + fracPadded).replace(/^0+/, "") || "0";
-  return negative ? `-${combined}` : combined;
-}
-
-/**
- * Core worker loop: polls a PLT event source and persists
- * finalized blocks + PLT transfers into the M3 tables.
- *
- * Source selection:
- *   - CRP_STREAM_SOURCE=demo       -> FakePltEventSource
- *   - CRP_STREAM_SOURCE=concordium -> ConcordiumPltEventSource
- *   - unset / anything else        -> defaults to "demo"
- *
- * Token selection (within this worker):
- *   - CONCORDIUM_PLT_TOKEN_ID      -> highest precedence
- *   - CRP_STREAM_TOKEN_ID          -> fallback
- *   - "usd:test"                   -> default
- *
- * Decimals selection:
- *   - CONCORDIUM_PLT_DECIMALS      -> highest precedence (if numeric)
- *   - getPltDecimals({network,tokenId}) -> registry fallback
- *   - 0                            -> final fallback
- */
-export async function runWorker(config: WorkerConfig): Promise<void> {
-  const {
-    pollIntervalMs,
-    network,
-    dryRun,
-    maxTicks,
-  } = config;
-
-  // Allow the worker to override the tokenId from env, even if the caller
-  // passed something else (keeps it consistent with debug:plt:stream).
-  const envTokenIdOverride = process.env.CONCORDIUM_PLT_TOKEN_ID;
-  const tokenId =
-    typeof envTokenIdOverride === "string" &&
-    envTokenIdOverride.trim() !== ""
-      ? envTokenIdOverride.trim()
-      : config.tokenId;
-
-  let { lastHeight } = config;
-
-  const assetKey: PltAssetKey = { network, tokenId };
-
-  // Registry decimals (from our in-memory map).
-  const registryDecimals = getPltDecimals(assetKey);
-
-  // Optional env override for decimals.
-  const envDecimalsRaw = process.env.CONCORDIUM_PLT_DECIMALS;
-  let decimals: number;
-
-  if (
-    typeof envDecimalsRaw === "string" &&
-    envDecimalsRaw.trim() !== "" &&
-    !Number.isNaN(Number(envDecimalsRaw))
-  ) {
-    decimals = Number(envDecimalsRaw);
-  } else if (
-    typeof registryDecimals === "number" &&
-    !Number.isNaN(registryDecimals)
-  ) {
-    decimals = registryDecimals;
-  } else {
-    decimals = 0;
-  }
-
-  const sourceKind = (process.env.CRP_STREAM_SOURCE ?? "demo")
-    .toLowerCase()
-    .trim();
-
-  let source: PltEventSource;
-
-  if (sourceKind === "concordium") {
-    const client = createConcordiumPltEventClientFromEnv();
-    source = new ConcordiumPltEventSource(
-      {
-        network,
-        tokenId,
-        decimals,
-      },
-      client
-    );
-  } else {
-    // Default: in-memory demo events
-    source = new FakePltEventSource({ network, tokenId });
-  }
-
-  // eslint-disable-next-line no-console
-  console.log("[CRP-STREAM] starting worker with config:", {
+  return {
     pollIntervalMs,
     network,
     tokenId,
@@ -141,155 +53,123 @@ export async function runWorker(config: WorkerConfig): Promise<void> {
     maxTicks,
     decimals,
     sourceKind,
-  });
+  };
+}
 
-  let ticks = 0;
-  let running = true;
-
-  while (running) {
-    ticks += 1;
-
-    const events = await source.fetchSince(lastHeight);
-
-    // eslint-disable-next-line no-console
-    console.log(
-      `[CRP-STREAM] fetched ${events.length} PLT event(s) above height ${lastHeight}`
-    );
-
-    for (const ev of events) {
-      if (ev.height > lastHeight) {
-        lastHeight = ev.height;
-      }
-
-      const blockHash = `demo-block-${String(ev.height).padStart(8, "0")}`;
-      const finalizedAt = new Date();
-
-      if (dryRun) {
-        const minor = humanToMinor(ev.amount, decimals);
-        // eslint-disable-next-line no-console
-        console.log("[CRP-STREAM] (dry-run) would process PLT event:", {
-          height: ev.height,
-          txHash: ev.txHash,
-          blockHash,
-          network,
-          tokenId,
-          amountHuman: ev.amount,
-          amountMinor: minor,
-          from: ev.from ?? null,
-          to: ev.to ?? "unknown",
-        });
-        continue;
-      }
-
-      // 1) Upsert the finalized block
-      const block = await upsertFinalizedBlock({
-        block_hash: blockHash,
-        network,
-        height: ev.height,
-        finalized_at: finalizedAt,
-      });
-
-      // 2) Insert the PLT transfer in minor units
-      const amountMinor = humanToMinor(ev.amount, decimals);
-
-      const { inserted } = await insertPltTransfers([
-        {
-          tx_hash: ev.txHash,
-          event_index: 0,
-          block_hash: block.block_hash,
-          network,
-          token_id: tokenId,
-          from_addr: ev.from ?? null,
-          to_addr: ev.to ?? "unknown",
-          amount_minor: amountMinor,
-          decimals,
-          occurred_at: finalizedAt,
-        },
-      ]);
-
-      // eslint-disable-next-line no-console
-      console.log("[CRP-STREAM] processed PLT event:", {
-        height: ev.height,
-        txHash: ev.txHash,
-        blockHash: block.block_hash,
-        amountMinor,
-        inserted,
-      });
-    }
-
-    if (typeof maxTicks === "number" && ticks >= maxTicks) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `[CRP-STREAM] maxTicks (${maxTicks}) reached, stopping loop.`
-      );
-      running = false;
-      break;
-    }
-
-    if (!running) break;
-
-    if (pollIntervalMs > 0 && running) {
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-    }
-  }
-
-  // eslint-disable-next-line no-console
-  console.log("[CRP-STREAM] worker stopped.");
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
- * Demo runner that constructs a WorkerConfig with sensible defaults
- * and runs the worker for a few ticks.
- *
- * Env overrides:
- *   CRP_STREAM_POLL_MS
- *   CRP_STREAM_NETWORK
- *
- *   Token id precedence:
- *     CONCORDIUM_PLT_TOKEN_ID
- *       -> CRP_STREAM_TOKEN_ID
- *       -> "usd:test"
- *
- *   CRP_STREAM_DRY_RUN        ("1" or "true")
- *   CRP_STREAM_START_HEIGHT
- *   CRP_STREAM_MAX_TICKS
- *   CRP_STREAM_SOURCE         ("demo" | "concordium")
+ * Core worker loop. Given a PLT source, continuously polls for new events
+ * strictly above `state.lastHeightExclusive`, writes them to Postgres, and
+ * advances the height.
  */
-export async function runDemo(): Promise<void> {
-  const envTokenId =
-    process.env.CONCORDIUM_PLT_TOKEN_ID ??
-    process.env.CRP_STREAM_TOKEN_ID ??
-    "usd:test";
+async function runWorker(
+  source: ConcordiumPltSource,
+  cfg: WorkerConfig,
+  state: { lastHeightExclusive: number }
+): Promise<void> {
+  console.log("[CRP-STREAM] starting worker with config:", {
+    pollIntervalMs: cfg.pollIntervalMs,
+    network: cfg.network,
+    tokenId: cfg.tokenId,
+    dryRun: cfg.dryRun,
+    lastHeight: state.lastHeightExclusive,
+    maxTicks: cfg.maxTicks,
+    decimals: cfg.decimals,
+    sourceKind: cfg.sourceKind,
+  });
 
-  const demoConfig: WorkerConfig = {
-    pollIntervalMs: Number(process.env.CRP_STREAM_POLL_MS ?? "1000"),
-    network: process.env.CRP_STREAM_NETWORK ?? "concordium:testnet",
-    tokenId: envTokenId,
-    dryRun:
-      process.env.CRP_STREAM_DRY_RUN === "1" ||
-      process.env.CRP_STREAM_DRY_RUN === "true",
-    lastHeight: Number(process.env.CRP_STREAM_START_HEIGHT ?? "0"),
-    maxTicks: process.env.CRP_STREAM_MAX_TICKS
-      ? Number(process.env.CRP_STREAM_MAX_TICKS)
-      : 3,
-  };
+  let tick = 0;
 
-  // eslint-disable-next-line no-console
-  console.log("[CRP-STREAM] demo runner starting with config:", demoConfig);
+  while (true) {
+    tick += 1;
+    if (cfg.maxTicks > 0 && tick > cfg.maxTicks) {
+      console.log("[CRP-STREAM] maxTicks (%d) reached, stopping loop.", cfg.maxTicks);
+      break;
+    }
 
-  try {
-    await runWorker(demoConfig);
-    // eslint-disable-next-line no-console
-    console.log("[CRP-STREAM] demo runner finished.");
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error("[CRP-STREAM] demo runner failed:", err);
-    process.exitCode = 1;
+    // Ask the source for any events above the last seen height.
+    const { events, bestHeight } = await source.fetchSince(state.lastHeightExclusive);
+
+    // Log a short summary similar to what you had before.
+    console.log("[CRP-STREAM] fetched %d PLT event(s) above height %d", events.length, state.lastHeightExclusive);
+
+    if (events.length > 0) {
+      // Map into DB insert rows.
+      const rows: PltTransferInsertInput[] = events.map((ev) => ({
+        tx_hash: ev.txHash,
+        event_index: ev.eventIndex,
+        block_hash: ev.blockHash,
+        block_height: ev.blockHeight,
+        network: ev.network,
+        token_id: ev.tokenId,
+        from_addr: ev.from,
+        to_addr: ev.to,
+        amount_minor: ev.amountMinor,
+        decimals: cfg.decimals,
+        occurred_at: ev.occurredAt,
+      }));
+
+      if (!cfg.dryRun) {
+        const inserted = await insertPltTransfers(rows);
+
+        // Log at least one processed event (using the last one as a representative).
+        const last = rows[rows.length - 1];
+        console.log("[CRP-STREAM] processed PLT event:", {
+          height: last.block_height,
+          txHash: last.tx_hash,
+          blockHash: last.block_hash,
+          amountMinor: last.amount_minor,
+          inserted,
+        });
+      } else {
+        console.log("[CRP-STREAM] dryRun=1, would insert rows:", rows.length);
+      }
+    }
+
+    // Advance last height to whatever the source reports as "best".
+    state.lastHeightExclusive = bestHeight;
+
+    // Simple polling delay.
+    if (cfg.pollIntervalMs > 0) {
+      await sleep(cfg.pollIntervalMs);
+    }
   }
 }
 
-// Allow `ts-node src/worker/main.ts` or `npm run crp:worker:demo` to run the demo.
+/**
+ * Demo entrypoint used by `npm run crp:worker:demo`.
+ */
+export async function runDemo(): Promise<void> {
+  const cfg = loadWorkerConfigFromEnv();
+
+  console.log("[CRP-STREAM] demo runner starting with config:", {
+    pollIntervalMs: cfg.pollIntervalMs,
+    network: cfg.network,
+    tokenId: cfg.tokenId,
+    dryRun: cfg.dryRun,
+    lastHeight: cfg.lastHeight,
+    maxTicks: cfg.maxTicks,
+  });
+
+  if (cfg.sourceKind !== "concordium") {
+    throw new Error(`Unsupported CRP_STREAM_SOURCE="${cfg.sourceKind}". Expected "concordium".`);
+  }
+
+  const nodeConfig = createConcordiumNodeConfigFromEnv();
+  const source = new ConcordiumPltSource(nodeConfig);
+
+  const state = { lastHeightExclusive: cfg.lastHeight };
+
+  await runWorker(source, cfg, state);
+}
+
+// If this file is executed directly, run the demo worker.
 if (require.main === module) {
-  // eslint-disable-next-line @typescript-eslint/no-floating-promises
-  runDemo();
+  runDemo().catch((err) => {
+    console.error("[CRP-STREAM] demo runner failed:", err);
+    process.exitCode = 1;
+  });
 }
