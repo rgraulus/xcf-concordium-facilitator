@@ -1,30 +1,34 @@
 // src/worker/pltSource.concordium.ts
 //
-// Concordium-backed PLT event source.
+// Concordium-backed PLT event source (latest-block only).
 //
-// Step 1 goal:
-//   - Connect to a Concordium node via gRPC (ConcordiumGRPCNodeClient).
-//   - Inspect the latest finalized block's transaction events.
-//   - Extract TokenUpdateSummary -> TokenTransferEvent for a single PLT token.
-//   - Map those into our internal PltEvent[] shape.
+// This implementation:
+//   - Connects to a Concordium node via gRPC (@concordium/web-sdk/nodejs).
+//   - Looks only at the *latest finalized block* on each call.
+//   - Fetches that block's transaction events.
+//   - Uses the shared PLT extractor (src/crp/pltExtractor.ts) to interpret
+//     TokenUpdate / TokenTransfer events for a single PLT token.
+//   - Maps those into the worker's internal PltEvent[] shape.
 //
-// Design notes:
-//   - We deliberately keep this "latest block only" for now. That is
-//     enough to prove end-to-end, read-only detection on real chain
-//     data. Later steps can broaden this to a proper height scan.
-//   - We avoid compile-time imports from @concordium/web-sdk/nodejs
-//     to stay friendly with the current tsconfig moduleResolution.
-//     Instead we use dynamic imports + 'any' at the edges.
-//   - We are conservative in our assumptions about the JS-SDK types:
+// Env interaction:
+//   - CONCORDIUM_NODE_URL        -> node URL (e.g. "grpc.testnet.concordium.com:20000").
+//   - CONCORDIUM_PLT_TOKEN_ID    -> on-chain PLT token id (for filtering). If unset,
+//                                   we fall back to cfg.tokenId.
 //
-//       * Block transaction events -> BlockItemSummaryInBlock-like.
-//       * TokenUpdateSummary has { transactionType: "TokenUpdate", events }.
-//       * TokenTransferEvent has { tag: "TokenTransfer", tokenId, amount, from, to }.
-//
-//     Where structure is uncertain, we log and fail soft (skip), not hard.
+// Height semantics:
+//   - Get latest finalized block info via getBlockInfo().
+//   - If blockHeight <= lastHeight: return [].
+//   - Else:
+//       * getBlockTransactionEvents(blockHash)
+//       * run PLT extractor
+//       * return events mapped to PltEvent[] with height = blockHeight.
 
 import type { PltEvent, PltEventSource } from "./pltSource";
 import { credentials } from "@grpc/grpc-js";
+import {
+  extractPltEventsFromBlockSummaries,
+  type BlockTransactionEventLike,
+} from "../crp/pltExtractor";
 
 /**
  * Minimal config for the Concordium PLT source.
@@ -32,7 +36,7 @@ import { credentials } from "@grpc/grpc-js";
 export interface ConcordiumPltEventSourceConfig {
   /** Logical network identifier, e.g. "concordium:testnet". */
   network: string;
-  /** Logical PLT token identifier, e.g. "usd:test". */
+  /** Logical PLT token identifier, e.g. "usd:test" or "EUDemo". */
   tokenId: string;
   /** Number of decimals for this PLT (used for logging / sanity). */
   decimals: number;
@@ -68,10 +72,10 @@ interface ConcordiumNodeConnection {
  * Parse CONCORDIUM_NODE_URL into (address, port, useTls).
  *
  * Supported forms:
- *   - "localhost:9095"         (no TLS)
- *   - "grpc.testnet.concordium.com:20000" (TLS)
- *   - "http://localhost:9095"  (no TLS)
- *   - "https://example.com:443" (TLS)
+ *   - "localhost:9095"                     (no TLS)
+ *   - "grpc.testnet.concordium.com:20000"  (TLS)
+ *   - "http://localhost:9095"              (no TLS)
+ *   - "https://example.com:443"            (TLS)
  */
 function parseNodeUrl(raw: string): ConcordiumNodeConnection {
   // If it looks like it has a scheme, go through URL.
@@ -107,15 +111,15 @@ function parseNodeUrl(raw: string): ConcordiumNodeConnection {
 
 let ConcordiumGRPCNodeClientCtor: any | undefined;
 let BlockHash: any | undefined;
-let grpcNamespace: any | undefined;
 
 /**
  * Load the relevant JS-SDK pieces via dynamic import.
  *
- * This keeps the TypeScript compile happy even though the
+ * This keeps TypeScript happy even though the
  * @concordium/web-sdk nodejs entrypoint uses ESM under the hood.
  */
-async function loadConcordiumSdkModules() {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function loadConcordiumSdkModules(): Promise<void> {
   if (!ConcordiumGRPCNodeClientCtor) {
     const dynamicImport = new Function(
       "specifier",
@@ -126,31 +130,29 @@ async function loadConcordiumSdkModules() {
     ConcordiumGRPCNodeClientCtor = nodejsModule.ConcordiumGRPCNodeClient;
   }
 
-  if (!BlockHash || !grpcNamespace) {
+  if (!BlockHash) {
     const dynamicImport = new Function(
       "specifier",
       "return import(specifier)"
     ) as (specifier: string) => Promise<any>;
 
     const webSdkModule = await dynamicImport("@concordium/web-sdk");
-    // BlockHash type helper + grpc namespace with isKnown/knownOrError.
     BlockHash = webSdkModule.BlockHash;
-    grpcNamespace = webSdkModule.grpc ?? webSdkModule;
   }
 }
 
 /**
  * Real Concordium-backed implementation of the PLT event client.
  *
- * For Step 1 we:
+ * Latest-block-only strategy:
  *   - Find the latest finalized block (via getBlockInfo()).
  *   - If its height <= lastHeight: return [].
  *   - Otherwise:
  *       * Fetch its transaction events (getBlockTransactionEvents).
- *       * Filter TokenUpdateSummary items.
- *       * Inside those, filter TokenTransferEvent for our PLT token.
+ *       * Run the shared PLT extractor.
  *       * Map to PltEvent[] with height = blockHeight.
  */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 class ConcordiumGrpcPltEventClient implements ConcordiumPltEventClient {
   private readonly nodeUrl: string;
 
@@ -175,7 +177,7 @@ class ConcordiumGrpcPltEventClient implements ConcordiumPltEventClient {
       lastHeight,
     });
 
-    if (!ConcordiumGRPCNodeClientCtor || !BlockHash || !grpcNamespace) {
+    if (!ConcordiumGRPCNodeClientCtor || !BlockHash) {
       // eslint-disable-next-line no-console
       console.warn(
         "[CRP-STREAM][concordium] Concordium JS-SDK modules not loaded; returning no events."
@@ -187,7 +189,8 @@ class ConcordiumGrpcPltEventClient implements ConcordiumPltEventClient {
       ? credentials.createSsl()
       : credentials.createInsecure();
 
-    const client = new ConcordiumGRPCNodeClientCtor(address, port, creds);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const client: any = new ConcordiumGRPCNodeClientCtor(address, port, creds);
 
     // 1) Get latest finalized block info.
     let blockInfo: any;
@@ -228,169 +231,76 @@ class ConcordiumGrpcPltEventClient implements ConcordiumPltEventClient {
     }
 
     const blockHashObj = blockInfo.blockHash;
-    const blockHash =
-      blockHashObj && typeof blockHashObj.toString === "function"
-        ? blockHashObj.toString()
+    const blockHashStr =
+      blockHashObj &&
+      typeof (blockHashObj as { toString?: () => string }).toString ===
+        "function"
+        ? (blockHashObj as { toString: () => string }).toString()
         : String(blockHashObj ?? "");
 
-    // 2) Fetch transaction events for this block only.
-    let txEventStream: AsyncIterable<any>;
-    try {
-      const bh = blockHash
-        ? BlockHash.fromHexString
-          ? BlockHash.fromHexString(blockHash)
-          : blockHash
-        : undefined;
-
-      txEventStream = bh
-        ? client.getBlockTransactionEvents(bh)
-        : client.getBlockTransactionEvents();
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[CRP-STREAM][concordium] Error while creating tx-event stream",
-        {
-          error: err,
-          blockHash,
-        }
-      );
-      return [];
-    }
-
-    const isKnown =
-      typeof grpcNamespace.isKnown === "function"
-        ? grpcNamespace.isKnown.bind(grpcNamespace)
-        : undefined;
-
+    const filterTokenIdEnv = process.env.CONCORDIUM_PLT_TOKEN_ID;
     const filterTokenId =
-      process.env.CONCORDIUM_PLT_TOKEN_ID && process.env.CONCORDIUM_PLT_TOKEN_ID.length > 0
-        ? process.env.CONCORDIUM_PLT_TOKEN_ID
+      typeof filterTokenIdEnv === "string" && filterTokenIdEnv.trim() !== ""
+        ? filterTokenIdEnv.trim()
         : cfg.tokenId;
 
-    const results: PltEvent[] = [];
-    const sampleTransactionTypes: string[] = [];
-    const sampleTokenEvents: any[] = [];
+    const summaries: BlockTransactionEventLike[] = [];
 
     try {
-      for await (const item of txEventStream) {
-        // BlockItemSummaryInBlock-like: { summary, transactionHash, ... }
-        const summary: any = item?.summary ?? item;
+      const bh =
+        BlockHash.fromHexString && typeof BlockHash.fromHexString === "function"
+          ? BlockHash.fromHexString(blockHashStr)
+          : blockHashStr;
 
-        if (!summary) {
-          continue;
-        }
+      const txEventStream = client.getBlockTransactionEvents(bh);
 
-        const txType: string =
-          summary.transactionType ?? summary.type ?? "<unknown>";
-        const txHashVal =
-          item?.transactionHash ??
-          summary.transactionHash ??
-          summary.hash ??
-          undefined;
-        const txHash =
-          txHashVal && typeof txHashVal.toString === "function"
-            ? txHashVal.toString()
-            : String(txHashVal ?? "");
-
-        if (sampleTransactionTypes.length < 5) {
-          sampleTransactionTypes.push(txType);
-        }
-
-        // We're only interested in token updates (TokenUpdateSummary).
-        if (txType !== "TokenUpdate") {
-          continue;
-        }
-
-        const events: any[] = Array.isArray(summary.events)
-          ? summary.events
-          : [];
-
-        for (const rawEv of events) {
-          const ev = isKnown && !isKnown(rawEv) ? undefined : rawEv;
-          if (!ev) {
-            continue;
-          }
-
-          // TokenTransferEvent: { tag: "TokenTransfer", tokenId, amount, from, to, ... }
-          if (ev.tag !== "TokenTransfer") {
-            continue;
-          }
-
-          if (sampleTokenEvents.length < 3) {
-            sampleTokenEvents.push(ev);
-          }
-
-          const tokenIdVal = ev.tokenId;
-          const tokenIdStr =
-            tokenIdVal && typeof tokenIdVal.toString === "function"
-              ? tokenIdVal.toString()
-              : String(tokenIdVal ?? "");
-
-          if (filterTokenId && tokenIdStr !== filterTokenId) {
-            continue;
-          }
-
-          const amountVal = ev.amount;
-          const amountStr =
-            amountVal && typeof amountVal.toString === "function"
-              ? amountVal.toString()
-              : String(amountVal ?? "");
-
-          const fromUp = ev.from;
-          const toUp = ev.to;
-
-          const fromVal = isKnown && !isKnown(fromUp) ? undefined : fromUp;
-          const toVal = isKnown && !isKnown(toUp) ? undefined : toUp;
-
-          const fromStr =
-            fromVal && typeof fromVal.toString === "function"
-              ? fromVal.toString()
-              : fromVal
-              ? JSON.stringify(fromVal)
-              : undefined;
-
-          const toStr =
-            toVal && typeof toVal.toString === "function"
-              ? toVal.toString()
-              : toVal
-              ? JSON.stringify(toVal)
-              : undefined;
-
-          results.push({
-            height: blockHeight,
-            txHash: txHash || `<unknown-${blockHeight}-${results.length}>`,
-            tokenId: cfg.tokenId, // logical token id used by CRP
-            amount: amountStr,
-            from: fromStr,
-            to: toStr,
-          });
-        }
+      for await (const item of txEventStream as AsyncIterable<unknown>) {
+        summaries.push(item as BlockTransactionEventLike);
       }
     } catch (err) {
       // eslint-disable-next-line no-console
       console.warn(
-        "[CRP-STREAM][concordium] Error while iterating tx-event stream",
-        {
-          error: err,
-          blockHash,
-        }
+        "[CRP-STREAM][concordium] Error while iterating getBlockTransactionEvents",
+        { blockHash: blockHashStr, error: err }
       );
       return [];
     }
 
-    // Debug samples for introspection.
-    // eslint-disable-next-line no-console
-    console.log("[CRP-STREAM][concordium] getBlockTransactionEvents sample", {
+    const extracted = extractPltEventsFromBlockSummaries({
       network: cfg.network,
-      tokenIdFilter: filterTokenId,
-      blockHash,
+      tokenId: cfg.tokenId,
+      filterTokenId,
+      blockHash: blockHashStr,
       blockHeight,
-      sampleTransactionTypes,
-      sampleTokenEvents,
-      matchedEvents: results.length,
+      summaries,
     });
 
-    return results;
+    // Debug log for this latest block.
+    // eslint-disable-next-line no-console
+    console.log("[CRP-STREAM][concordium] latest-block sample", {
+      network: cfg.network,
+      tokenIdFilter: filterTokenId,
+      blockHash: blockHashStr,
+      blockHeight,
+      totalSummaries: summaries.length,
+      matchedEvents: extracted.length,
+      sampleSummaries: summaries.slice(0, 1),
+      sampleEvents: extracted.slice(0, 1),
+    });
+
+    const events: PltEvent[] = extracted.map((ev) => ({
+      height: ev.blockHeight,
+      txHash: ev.txHash,
+      tokenId: ev.tokenId,
+      amount: ev.amount,
+      from: ev.from,
+      to: ev.to,
+    }));
+
+    // Enforce > lastHeight & ascending height.
+    return events
+      .filter((ev) => ev.height > lastHeight)
+      .sort((a, b) => a.height - b.height);
   }
 }
 
@@ -423,7 +333,7 @@ export class ConcordiumPltEventSource implements PltEventSource {
  *
  * Env vars:
  *   - CONCORDIUM_NODE_URL      -> e.g. "grpc.testnet.concordium.com:20000"
- *   - CONCORDIUM_PLT_TOKEN_ID  -> on-chain PLT token id (e.g. "t-USD"), optional.
+ *   - CONCORDIUM_PLT_TOKEN_ID  -> on-chain PLT token id (e.g. "EUDemo"), optional.
  *
  * If CONCORDIUM_PLT_TOKEN_ID is not set, we fall back to cfg.tokenId.
  */
@@ -433,4 +343,3 @@ export function createConcordiumPltEventClientFromEnv(): ConcordiumPltEventClien
 
   return new ConcordiumGrpcPltEventClient(nodeUrl);
 }
-

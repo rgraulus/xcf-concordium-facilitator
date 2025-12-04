@@ -1,212 +1,201 @@
 // src/store/plt.pg.ts
-import { pool } from "../db/pool";
+//
+// Postgres helpers for PLT-related data:
+//   - crp_finalized_blocks
+//   - crp_plt_events
+//
+// Public API (used by the worker):
+//   - upsertFinalizedBlock(input)
+//   - insertPltTransfers(events)
 
-/**
- * Storage helpers for finalized blocks and PLT transfers.
- * Schema is defined in db/migrations/002_m3_stream.sql.
- */
+import { Pool } from "pg";
 
-export type FinalizedBlock = {
+export interface UpsertFinalizedBlockInput {
   block_hash: string;
-  network: string;        // e.g. "concordium:testnet"
-  height: number;         // BIGINT -> JS number (be cautious if heights get very large)
-  finalized_at: string;   // ISO string
-  created_at: string;     // ISO string
-};
+  network: string;
+  height: number;
+  finalized_at: Date;
+}
 
-export type PltTransfer = {
+export interface FinalizedBlockRow {
+  block_hash: string;
+  network: string;
+  height: number;
+  finalized_at: Date;
+}
+
+export interface PltTransferInsertInput {
+  network: string;
+  token_id: string;
   tx_hash: string;
   event_index: number;
   block_hash: string;
-  network: string;
-  token_id: string;
+  block_height: number;
   from_addr: string | null;
-  to_addr: string;
-  amount_minor: string;   // numeric(38,0) -> string in JS
+  to_addr: string | null;
+  amount_minor: string; // minor units, e.g. "1000000" for 1.000000 with 6 decimals
   decimals: number;
-  occurred_at: string;    // ISO string
-  created_at: string;     // ISO string
-};
+  occurred_at: Date;
+}
 
-function toFinalizedBlockRow(row: any): FinalizedBlock {
+export interface InsertPltTransfersResult {
+  inserted: number;
+}
+
+let pool: Pool | null = null;
+let schemaInitialized = false;
+let schemaInitPromise: Promise<void> | null = null;
+
+function getPool(): Pool {
+  if (!pool) {
+    const databaseUrl =
+      process.env.DATABASE_URL ??
+      "postgres://postgres:pg@127.0.0.1:5432/postgres";
+
+    // eslint-disable-next-line no-console
+    console.log("[DB] Using", databaseUrl);
+
+    pool = new Pool({ connectionString: databaseUrl });
+  }
+  return pool;
+}
+
+async function ensureSchema(): Promise<void> {
+  if (schemaInitialized) return;
+  if (!schemaInitPromise) {
+    const p = getPool();
+    schemaInitPromise = (async () => {
+      // Idempotent, conservative schema creation. If tables already exist,
+      // these CREATE TABLE IF NOT EXISTS statements are no-ops and we do
+      // not attempt to ALTER anything.
+      await p.query(`
+        CREATE TABLE IF NOT EXISTS crp_finalized_blocks (
+          block_hash   TEXT        NOT NULL,
+          network      TEXT        NOT NULL,
+          height       BIGINT      NOT NULL,
+          finalized_at TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (block_hash, network)
+        )
+      `);
+
+      await p.query(`
+        CREATE TABLE IF NOT EXISTS crp_plt_events (
+          id           BIGSERIAL PRIMARY KEY,
+          network      TEXT        NOT NULL,
+          token_id     TEXT        NOT NULL,
+          tx_hash      TEXT        NOT NULL,
+          event_index  INTEGER     NOT NULL,
+          block_hash   TEXT        NOT NULL,
+          block_height BIGINT      NOT NULL,
+          from_addr    TEXT,
+          to_addr      TEXT,
+          amount_minor TEXT        NOT NULL,
+          decimals     INTEGER     NOT NULL,
+          occurred_at  TIMESTAMPTZ NOT NULL,
+          inserted_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+
+      schemaInitialized = true;
+    })();
+  }
+  return schemaInitPromise;
+}
+
+/**
+ * Upsert a finalized block row keyed by (block_hash, network).
+ */
+export async function upsertFinalizedBlock(
+  input: UpsertFinalizedBlockInput
+): Promise<FinalizedBlockRow> {
+  await ensureSchema();
+  const p = getPool();
+
+  const res = await p.query(
+    `
+    INSERT INTO crp_finalized_blocks (
+      block_hash,
+      network,
+      height,
+      finalized_at
+    )
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (block_hash, network)
+    DO UPDATE SET
+      height       = EXCLUDED.height,
+      finalized_at = EXCLUDED.finalized_at
+    RETURNING block_hash, network, height, finalized_at
+    `,
+    [input.block_hash, input.network, input.height, input.finalized_at]
+  );
+
+  const row = res.rows[0];
+
   return {
     block_hash: row.block_hash,
     network: row.network,
     height: Number(row.height),
-    finalized_at: new Date(row.finalized_at).toISOString(),
-    created_at: new Date(row.created_at).toISOString(),
-  };
-}
-
-function toPltTransferRow(row: any): PltTransfer {
-  return {
-    tx_hash: row.tx_hash,
-    event_index: Number(row.event_index),
-    block_hash: row.block_hash,
-    network: row.network,
-    token_id: row.token_id,
-    from_addr: row.from_addr ?? null,
-    to_addr: row.to_addr,
-    amount_minor: row.amount_minor.toString(), // numeric -> string
-    decimals: Number(row.decimals),
-    occurred_at: new Date(row.occurred_at).toISOString(),
-    created_at: new Date(row.created_at).toISOString(),
+    finalized_at: row.finalized_at,
   };
 }
 
 /**
- * Upsert a finalized block by block_hash.
- * If it already exists, height/network/finalized_at are updated.
- */
-export async function upsertFinalizedBlock(input: {
-  block_hash: string;
-  network: string;
-  height: number | string;
-  finalized_at: string | Date;
-}): Promise<FinalizedBlock> {
-  const { block_hash, network, height, finalized_at } = input;
-
-  const res = await pool.query(
-    `
-    INSERT INTO blocks_finalized (block_hash, network, height, finalized_at)
-    VALUES ($1, $2, $3, $4)
-    ON CONFLICT (block_hash)
-    DO UPDATE SET
-      network = EXCLUDED.network,
-      height = EXCLUDED.height,
-      finalized_at = EXCLUDED.finalized_at
-    RETURNING *;
-    `,
-    [
-      block_hash,
-      network,
-      height,
-      new Date(finalized_at).toISOString(),
-    ]
-  );
-
-  return toFinalizedBlockRow(res.rows[0]);
-}
-
-/**
- * Batch insert PLT transfers.
- * - ON CONFLICT DO NOTHING on (tx_hash, event_index) to keep this idempotent.
- * - Returns the number of rows successfully inserted (not counting conflicts).
+ * Insert one or more PLT transfer rows into crp_plt_events.
+ *
+ * We explicitly include block_height because the existing schema
+ * has this column as NOT NULL.
  */
 export async function insertPltTransfers(
-  transfers: Array<{
-    tx_hash: string;
-    event_index: number;
-    block_hash: string;
-    network: string;
-    token_id: string;
-    from_addr: string | null;
-    to_addr: string;
-    amount_minor: string | number; // integer minor units
-    decimals: number;
-    occurred_at: string | Date;
-  }>
-): Promise<{ inserted: number }> {
-  if (transfers.length === 0) {
+  events: PltTransferInsertInput[]
+): Promise<InsertPltTransfersResult> {
+  if (events.length === 0) {
     return { inserted: 0 };
   }
 
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
+  await ensureSchema();
+  const p = getPool();
 
-    let inserted = 0;
-    for (const t of transfers) {
-      const res = await client.query(
-        `
-        INSERT INTO plt_transfers (
-          tx_hash,
-          event_index,
-          block_hash,
-          network,
-          token_id,
-          from_addr,
-          to_addr,
-          amount_minor,
-          decimals,
-          occurred_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-        ON CONFLICT (tx_hash, event_index)
-        DO NOTHING
-        RETURNING *;
-        `,
-        [
-          t.tx_hash,
-          t.event_index,
-          t.block_hash,
-          t.network,
-          t.token_id,
-          t.from_addr,
-          t.to_addr,
-          t.amount_minor,
-          t.decimals,
-          new Date(t.occurred_at).toISOString(),
-        ]
-      );
+  const values: any[] = [];
+  const chunks: string[] = [];
 
-      if ((res.rowCount ?? 0) > 0) {
-        inserted += res.rowCount!;
-      }
-    }
+  events.forEach((ev, idx) => {
+    const base = idx * 11;
+    chunks.push(
+      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11})`
+    );
 
-    await client.query("COMMIT");
-    return { inserted };
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
-}
+    values.push(
+      ev.network,
+      ev.token_id,
+      ev.tx_hash,
+      ev.event_index,
+      ev.block_hash,
+      ev.block_height,
+      ev.from_addr,
+      ev.to_addr,
+      ev.amount_minor,
+      ev.decimals,
+      ev.occurred_at
+    );
+  });
 
-/**
- * Search PLT transfers for the matching endpoint.
- * All filters are optional; if none provided, this returns the most recent transfers
- * (bounded by limit).
- */
-export async function searchPltTransfers(filters: {
-  tokenId?: string;
-  to?: string;
-  amountMinor?: string;      // integer minor units as string
-  limit?: number;
-}): Promise<PltTransfer[]> {
-  const where: string[] = [];
-  const params: any[] = [];
-  let idx = 1;
+  const sql = `
+    INSERT INTO crp_plt_events (
+      network,
+      token_id,
+      tx_hash,
+      event_index,
+      block_hash,
+      block_height,
+      from_addr,
+      to_addr,
+      amount_minor,
+      decimals,
+      occurred_at
+    )
+    VALUES ${chunks.join(", ")}
+  `;
 
-  if (filters.tokenId) {
-    where.push(`token_id = $${idx++}`);
-    params.push(filters.tokenId);
-  }
-
-  if (filters.to) {
-    where.push(`to_addr = $${idx++}`);
-    params.push(filters.to);
-  }
-
-  if (filters.amountMinor) {
-    where.push(`amount_minor = $${idx++}`); // exact match on numeric(38,0)
-    params.push(filters.amountMinor);
-  }
-
-  const limit = filters.limit && filters.limit > 0 ? filters.limit : 25;
-  const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-
-  const res = await pool.query(
-    `
-    SELECT *
-      FROM plt_transfers
-      ${whereClause}
-     ORDER BY occurred_at DESC
-     LIMIT $${idx};
-    `,
-    [...params, limit]
-  );
-
-  return res.rows.map(toPltTransferRow);
+  const res = await p.query(sql, values);
+  return { inserted: res.rowCount ?? 0 };
 }
