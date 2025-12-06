@@ -6,6 +6,7 @@
 // - Wires /metrics JSON metrics endpoint
 // - Wires CRP core routes (/v1/crp/*)
 // - Wires PLT search route (/v1/crp/plt/search)
+// - Wires CRP payments routes (/v1/crp/payments/*)
 
 import fastify, { FastifyInstance } from "fastify";
 
@@ -21,6 +22,9 @@ import readyzRoute from "./http/readyz";
 
 // JSON metrics endpoint (/metrics)
 import metricsRoute from "./http/metrics";
+
+// CRP payments routes (/v1/crp/payments/*)
+import crpPaymentsRoute from "./routes/crp.payments";
 
 export function buildServer(): FastifyInstance {
   const app = fastify({
@@ -41,6 +45,10 @@ export function buildServer(): FastifyInstance {
 
   // PLT search route: /v1/crp/plt/search
   app.register(crpPltRoute);
+
+  // CRP payments routes under /v1/crp/payments/*
+  // The plugin itself mounts under /payments, so we prefix it with /v1/crp.
+  app.register(crpPaymentsRoute, { prefix: "/v1/crp" });
 
   return app;
 }
