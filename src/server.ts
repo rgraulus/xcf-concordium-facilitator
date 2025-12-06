@@ -2,6 +2,7 @@
 //
 // Fastify server wiring for XCF Concordium Facilitator.
 // - Wires health routes
+// - Wires /readyz operational readiness route
 // - Wires CRP core routes (/v1/crp/*)
 // - Wires PLT search route (/v1/crp/plt/search)
 
@@ -14,10 +15,16 @@ import crpRoutes from "./routes/crp";
 // PLT search over crp_plt_events (backed by Postgres)
 import crpPltRoute from "./routes/crp.plt";
 
+// Operational readiness (/readyz) – DB + wallet-proxy checks
+import readyzRoute from "./http/readyz";
+
 export function buildServer(): FastifyInstance {
   const app = fastify({
     logger: true,
   });
+
+  // Operational readiness first, so orchestrators can probe quickly.
+  app.register(readyzRoute);
 
   // Basic health checks
   app.register(healthRoute);
