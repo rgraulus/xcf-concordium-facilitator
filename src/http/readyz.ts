@@ -11,14 +11,20 @@
 // Wallet-proxy checks can be disabled via READYZ_CHECK_WALLET_PROXY=0/false
 // if needed in dev environments.
 //
-// This file also maintains a tiny in-memory metrics stub so we have a place
-// to plug in real metrics later.
+// This file uses the central metrics registry so that /metrics can expose
+// basic readiness counters.
 
 import type { FastifyPluginCallback } from "fastify";
 import { Client } from "pg";
 import * as http from "http";
 import * as https from "https";
 import { URL } from "url";
+import {
+  incrementReadyzTotalChecks,
+  incrementReadyzSuccess,
+  incrementReadyzDbFailures,
+  incrementReadyzWalletProxyFailures,
+} from "../metrics/registry";
 
 interface DbCheckResult {
   ok: boolean;
@@ -40,14 +46,6 @@ interface ReadyzResponseBody {
     walletProxy: string;
   };
 }
-
-// Very small in-memory metrics stub.
-const readyzMetrics = {
-  totalChecks: 0,
-  success: 0,
-  dbFailures: 0,
-  walletProxyFailures: 0,
-};
 
 async function checkDb(databaseUrl: string): Promise<DbCheckResult> {
   const client = new Client({ connectionString: databaseUrl });
@@ -143,7 +141,7 @@ async function checkWalletProxyHealth(
 
 const readyzPlugin: FastifyPluginCallback = async (server) => {
   server.get("/readyz", async (request, reply) => {
-    readyzMetrics.totalChecks += 1;
+    incrementReadyzTotalChecks();
 
     const databaseUrl =
       process.env.DATABASE_URL ??
@@ -166,7 +164,7 @@ const readyzPlugin: FastifyPluginCallback = async (server) => {
     // --- DB check ---
     const dbResult = await checkDb(databaseUrl);
     if (!dbResult.ok) {
-      readyzMetrics.dbFailures += 1;
+      incrementReadyzDbFailures();
       request.log.error(
         { err: dbResult.errorMessage, databaseUrl },
         "[readyz] database connectivity check failed"
@@ -186,7 +184,7 @@ const readyzPlugin: FastifyPluginCallback = async (server) => {
       );
 
       if (!wpResult.ok) {
-        readyzMetrics.walletProxyFailures += 1;
+        incrementReadyzWalletProxyFailures();
         request.log.error(
           {
             walletProxyBaseUrl,
@@ -202,7 +200,7 @@ const readyzPlugin: FastifyPluginCallback = async (server) => {
     const overallOk = dbResult.ok && (!walletProxyEnabled || wpResult.ok);
 
     if (overallOk) {
-      readyzMetrics.success += 1;
+      incrementReadyzSuccess();
     }
 
     const body: ReadyzResponseBody = {
