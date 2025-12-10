@@ -23,3 +23,4 @@ ed25519.pem
 
 # local private keys / wallet exports (never commit)
 keys/
+NUL
