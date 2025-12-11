@@ -1,83 +1,132 @@
 // src/tools/applyCrpPltEventsMigration.ts
 //
-// Small helper to create the crp_plt_events table via Node/pg,
-// so we don't depend on the psql CLI being installed.
+// M3.2 – PLT schema + registry
+// Creates:
+//   - crp_plt_assets: PLT asset/decimals registry
+//   - crp_plt_events: raw PLT transfer events
 //
-// Usage:
-//
-//   export DATABASE_URL=postgres://postgres:pg@127.0.0.1:5432/postgres
-//   npx ts-node src/tools/applyCrpPltEventsMigration.ts
-//
+// Safe to run multiple times (CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS).
 
-import "dotenv/config";
 import { Client } from "pg";
 
-const MIGRATION_SQL = `
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1
-    FROM   information_schema.tables
-    WHERE  table_schema = 'public'
-    AND    table_name   = 'crp_plt_events'
-  ) THEN
-    CREATE TABLE public.crp_plt_events (
-      id            BIGSERIAL PRIMARY KEY,
-      network       TEXT        NOT NULL,  -- e.g. "concordium:testnet"
-      token_id      TEXT        NOT NULL,  -- on-chain PLT token id, e.g. "EUDemo"
-      tx_hash       TEXT        NOT NULL,  -- transaction hash (hex string)
-      event_index   INTEGER     NOT NULL,  -- index of the event within the tx
-      block_hash    TEXT        NOT NULL,  -- containing block hash (hex string)
-      block_height  BIGINT      NOT NULL,  -- containing block height
-      from_addr     TEXT        NOT NULL,  -- sender address (CCD account or contract)
-      to_addr       TEXT        NOT NULL,  -- recipient address
-      amount_minor  NUMERIC(30,0) NOT NULL, -- integer amount in minor units (scaled by decimals)
-      decimals      INTEGER     NOT NULL,  -- token decimals (e.g. 6 for EUDemo)
-      occurred_at   TIMESTAMPTZ NOT NULL,  -- when it happened on-chain (approx/finalized time)
-      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW() -- when we stored it
-    );
+function getConnectionString(): string {
+  const conn =
+    process.env.CRP_DB_CONN_STRING ??
+    process.env.DATABASE_URL ??
+    // Fallback for local xcf-pg (shared with transaction-logger)
+    "postgres://postgres:pg@127.0.0.1:5432/transaction-outcome";
+  return conn;
+}
 
-    CREATE INDEX crp_plt_events_token_idx
-      ON public.crp_plt_events (network, token_id);
+async function main(): Promise<void> {
+  const connectionString = getConnectionString();
+  const client = new Client({ connectionString });
 
-    CREATE INDEX crp_plt_events_block_idx
-      ON public.crp_plt_events (block_height DESC);
+  console.log(
+    JSON.stringify({
+      source: "plt-migration",
+      step: "connecting",
+      connectionStringRedacted: true,
+    })
+  );
 
-    CREATE INDEX crp_plt_events_tx_idx
-      ON public.crp_plt_events (tx_hash, event_index);
-
-    CREATE INDEX crp_plt_events_addr_idx
-      ON public.crp_plt_events (from_addr, to_addr);
-  END IF;
-END
-$$;
-`;
-
-async function main() {
-  const dbUrl =
-    process.env.DATABASE_URL ||
-    "postgres://postgres:pg@127.0.0.1:5432/postgres";
-
-  // eslint-disable-next-line no-console
-  console.log("[PLT-MIGRATE] Using DATABASE_URL:", dbUrl);
-
-  const client = new Client({ connectionString: dbUrl });
   await client.connect();
 
   try {
-    // eslint-disable-next-line no-console
-    console.log("[PLT-MIGRATE] Applying crp_plt_events migration...");
-    await client.query(MIGRATION_SQL);
-    // eslint-disable-next-line no-console
-    console.log("[PLT-MIGRATE] Migration applied successfully.");
+    console.log(
+      JSON.stringify({
+        source: "plt-migration",
+        step: "begin",
+      })
+    );
+
+    await client.query("BEGIN;");
+
+    // 1) Asset / decimals registry
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS crp_plt_assets (
+        asset_id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        decimals INTEGER NOT NULL,
+        description TEXT,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    // 2) Raw PLT transfer events
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS crp_plt_events (
+        id BIGSERIAL PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+        -- Chain location
+        block_hash TEXT NOT NULL,
+        block_height BIGINT NOT NULL,
+        transaction_hash TEXT NOT NULL,
+        event_index INTEGER NOT NULL,
+
+        -- Semantics
+        event_type TEXT NOT NULL, -- e.g. 'transfer', 'mint', 'burn'
+        from_address TEXT,
+        to_address TEXT,
+
+        -- Amount in atomic units (raw integer)
+        amount_raw NUMERIC(38, 0) NOT NULL,
+        asset_id TEXT NOT NULL REFERENCES crp_plt_assets(asset_id),
+
+        -- Network / rail
+        network_genesis_index INTEGER NOT NULL,
+        finalized BOOLEAN NOT NULL DEFAULT TRUE,
+
+        -- One row per on-chain event
+        UNIQUE (transaction_hash, event_index)
+      );
+    `);
+
+    // Indexes to support common lookups:
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS crp_plt_events_block_height_idx
+        ON crp_plt_events (block_height);
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS crp_plt_events_tx_hash_idx
+        ON crp_plt_events (transaction_hash);
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS crp_plt_events_to_addr_amount_idx
+        ON crp_plt_events (to_address, asset_id, amount_raw);
+    `);
+
+    await client.query("COMMIT;");
+
+    console.log(
+      JSON.stringify({
+        source: "plt-migration",
+        step: "done",
+        tables: ["crp_plt_assets", "crp_plt_events"],
+      })
+    );
   } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error("[PLT-MIGRATE] Error while applying migration:", err);
+    console.error("[plt-migration] failed:", err);
+    try {
+      await client.query("ROLLBACK;");
+    } catch {
+      // ignore rollback failure
+    }
     process.exitCode = 1;
   } finally {
     await client.end();
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-floating-promises
-main();
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("[plt-migration] crashed:", err);
+    process.exitCode = 1;
+  });
+}
