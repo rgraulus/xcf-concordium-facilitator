@@ -1,108 +1,93 @@
 // src/tools/debugPltDb.ts
 //
-// Stronger debug tool for crp_plt_events and crp_finalized_blocks.
-//
-// Usage:
-//   DATABASE_URL=postgres://... npm run debug:plt:db
-//
-// It will:
-//   - Check that crp_plt_events exists.
-//   - Print total row count.
-//   - Dump the latest rows.
-//   - Optionally show crp_finalized_blocks row count.
+// M3.2 – Quick snapshot of PLT schema
+// Shows:
+//   - counts for crp_plt_assets / crp_plt_events
+//   - up to 10 assets
+//   - up to 10 most recent events
 
-import { Pool } from "pg";
+import { Client } from "pg";
 
-async function main() {
-  const databaseUrl =
+function getConnectionString(): string {
+  const conn =
+    process.env.CRP_DB_CONN_STRING ??
     process.env.DATABASE_URL ??
-    "postgres://postgres:pg@127.0.0.1:5432/postgres";
+    "postgres://postgres:pg@127.0.0.1:5432/transaction-outcome";
+  return conn;
+}
 
-  console.log("[PLT-DB-DEBUG] Using DATABASE_URL:", databaseUrl);
+async function main(): Promise<void> {
+  const connectionString = getConnectionString();
+  const client = new Client({ connectionString });
 
-  const pool = new Pool({ connectionString: databaseUrl });
-  const client = await pool.connect();
+  console.log(
+    JSON.stringify({
+      source: "debug-plt-db",
+      step: "connecting",
+      connectionStringRedacted: true,
+    })
+  );
+
+  await client.connect();
 
   try {
-    console.log("[PLT-DB-DEBUG] Connected to Postgres");
-
-    // 1) Check that the table exists in the current database / schema.
-    const tableCheck = await client.query(
-      "SELECT to_regclass('public.crp_plt_events') AS table_name"
+    const { rows: assetCountRows } = await client.query<{ count: string }>(
+      "SELECT COUNT(*) AS count FROM crp_plt_assets;"
     );
-    const tableName = tableCheck.rows[0]?.table_name as string | null;
-
-    if (!tableName) {
-      console.log(
-        "[PLT-DB-DEBUG] Table crp_plt_events does NOT exist in this database/schema."
-      );
-      return;
-    }
-
-    console.log("[PLT-DB-DEBUG] Table found:", tableName);
-
-    // 2) Total count.
-    const countRes = await client.query(
-      "SELECT COUNT(*) AS total FROM crp_plt_events"
+    const { rows: eventCountRows } = await client.query<{ count: string }>(
+      "SELECT COUNT(*) AS count FROM crp_plt_events;"
     );
-    const total = countRes.rows[0]?.total;
-    console.log("[PLT-DB-DEBUG] Total rows in crp_plt_events:", total);
-
-    // 3) Latest rows.
-    const rowsRes = await client.query(
+    const { rows: assetRows } = await client.query(
+      `
+      SELECT asset_id, symbol, decimals, enabled
+      FROM crp_plt_assets
+      ORDER BY asset_id
+      LIMIT 10;
+      `
+    );
+    const { rows: eventRows } = await client.query(
       `
       SELECT
-        block_hash,
-        network,
-        token_id,
-        from_addr,
-        to_addr,
-        amount_minor,
-        decimals,
-        occurred_at,
-        tx_hash,
-        event_index
+        id,
+        block_height,
+        transaction_hash,
+        event_index,
+        amount_raw,
+        asset_id,
+        to_address
       FROM crp_plt_events
-      ORDER BY occurred_at DESC NULLS LAST,
-               block_hash,
-               tx_hash,
-               event_index DESC
-      LIMIT 10
+      ORDER BY id DESC
+      LIMIT 10;
       `
     );
 
-    if (rowsRes.rows.length === 0) {
-      console.log("[PLT-DB-DEBUG] No rows to display from crp_plt_events.");
-    } else {
-      console.log(
-        "[PLT-DB-DEBUG] Latest rows from crp_plt_events:\n" +
-          JSON.stringify(rowsRes.rows, null, 2)
-      );
-    }
-
-    // 4) Optional: show finalized block count if the table exists.
-    try {
-      const blkRes = await client.query(
-        "SELECT COUNT(*) AS total FROM crp_finalized_blocks"
-      );
-      console.log(
-        "[PLT-DB-DEBUG] Total rows in crp_finalized_blocks:",
-        blkRes.rows[0]?.total
-      );
-    } catch (err) {
-      console.log(
-        "[PLT-DB-DEBUG] crp_finalized_blocks not found or not readable:",
-        (err as Error).message
-      );
-    }
+    console.log(
+      JSON.stringify(
+        {
+          source: "debug-plt-db",
+          step: "snapshot",
+          counts: {
+            assets: Number(assetCountRows[0]?.count ?? "0"),
+            events: Number(eventCountRows[0]?.count ?? "0"),
+          },
+          sampleAssets: assetRows,
+          sampleEvents: eventRows,
+        },
+        null,
+        2
+      )
+    );
   } catch (err) {
-    console.error("[PLT-DB-DEBUG] Error while inspecting PLT DB:", err);
+    console.error("[debug-plt-db] failed:", err);
+    process.exitCode = 1;
   } finally {
-    client.release();
-    await pool.end();
+    await client.end();
   }
 }
 
-main().catch((err) => {
-  console.error("[PLT-DB-DEBUG] Fatal error in debugPltDb:", err);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("[debug-plt-db] crashed:", err);
+    process.exitCode = 1;
+  });
+}
