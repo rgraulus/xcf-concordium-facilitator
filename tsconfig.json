@@ -23,7 +23,17 @@
     /* Node types */
     "types": ["node"]
   },
-  "include": ["src/**/*.ts"],
+
+  /* Explicit extra files to include in the program */
+  "files": [
+    "concordium-web-sdk-nodejs.d.ts"
+  ],
+
+  /* Main source tree */
+  "include": [
+    "src/**/*.ts"
+  ],
+
   "exclude": [
     "dist",
     "node_modules",

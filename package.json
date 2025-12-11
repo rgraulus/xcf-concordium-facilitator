@@ -25,6 +25,8 @@
     "migration:apply:plt": "ts-node src/tools/applyCrpPltEventsMigration.ts",
     "debug:plt:stream": "ts-node src/tools/debugPltStreamConfig.ts",
     "debug:tx:summary": "ts-node src/tools/debugTxSummary.ts",
+    "probe:grpc-node": "ts-node scripts/grpc-node-probe.ts",
+    "probe:web-sdk": "ts-node scripts/web-sdk-probe.ts",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:ci": "echo \"No tests yet (CI)\" && exit 0"
   },
