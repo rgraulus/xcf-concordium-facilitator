@@ -27,6 +27,7 @@
     "debug:tx:summary": "ts-node src/tools/debugTxSummary.ts",
     "probe:grpc-node": "ts-node scripts/grpc-node-probe.ts",
     "probe:web-sdk": "ts-node scripts/web-sdk-probe.ts",
+    "probe:web-sdk:local": "cross-env CONCORDIUM_GRPC_HOST=127.0.0.1 CONCORDIUM_GRPC_PORT=20100 CONCORDIUM_GRPC_TLS=0 ts-node scripts/web-sdk-probe.ts",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:ci": "echo \"No tests yet (CI)\" && exit 0"
   },
@@ -49,6 +50,7 @@
     "ajv": "^8.17.1",
     "ajv-cli": "^5.0.0",
     "ajv-formats": "^3.0.1",
+    "cross-env": "^7.0.3",
     "jest": "^30.2.0",
     "ts-jest": "^29.4.5",
     "ts-node": "^10.9.2",
