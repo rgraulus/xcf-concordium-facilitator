@@ -16,7 +16,7 @@ import * as dotenv from 'dotenv';
 // Load env so we can reuse CONCORDIUM_* vars if present.
 dotenv.config();
 
-interface ProbeConfig {
+export interface WebSdkNodeConfig {
   host: string;
   port: number;
   useTls: boolean;
@@ -26,7 +26,7 @@ interface ProbeConfig {
 /**
  * JSON.stringify that is safe for BigInt by converting BigInt -> string.
  */
-function safeStringify(value: unknown, space: number = 2): string {
+export function safeStringify(value: unknown, space: number = 2): string {
   return JSON.stringify(
     value,
     (_key, v) => (typeof v === 'bigint' ? v.toString() : v),
@@ -34,7 +34,13 @@ function safeStringify(value: unknown, space: number = 2): string {
   );
 }
 
-function loadProbeConfig(): ProbeConfig {
+/**
+ * Load Concordium gRPC config from environment, with sensible defaults.
+ * This is shared between:
+ *   - scripts/web-sdk-probe.ts  (CLI probe)
+ *   - src/tools/ingestPltFromTxWebSdk.ts (PLT ingest skeleton)
+ */
+export function loadWebSdkNodeConfigFromEnv(): WebSdkNodeConfig {
   const host =
     process.env.CONCORDIUM_GRPC_HOST ?? 'grpc.testnet.concordium.com';
   const port = Number(process.env.CONCORDIUM_GRPC_PORT ?? 20000);
@@ -51,8 +57,32 @@ function loadProbeConfig(): ProbeConfig {
   return { host, port, useTls, timeoutMs };
 }
 
+/**
+ * Build a ConcordiumGRPCNodeClient using the config above.
+ * We deliberately do NOT use ConcordiumGRPCNodeClient as a *type*,
+ * only as a runtime value, to avoid TS2709 ("Cannot use namespace as a type")
+ * with some versions of the web-sdk typings.
+ */
+export function createWebSdkNodeClient(cfg: WebSdkNodeConfig) {
+  const channelCreds = cfg.useTls
+    ? credentials.createSsl()
+    : credentials.createInsecure();
+
+  // Node-specific gRPC client (not usable in browser envs).
+  const client = new ConcordiumGRPCNodeClient(
+    cfg.host,
+    cfg.port,
+    channelCreds,
+    {
+      timeout: cfg.timeoutMs,
+    }
+  );
+
+  return client;
+}
+
 async function main(): Promise<void> {
-  const cfg = loadProbeConfig();
+  const cfg = loadWebSdkNodeConfigFromEnv();
   const endpoint = `${cfg.host}:${cfg.port}`;
 
   console.log(
@@ -68,20 +98,13 @@ async function main(): Promise<void> {
     )
   );
 
-  // Build the underlying gRPC channel credentials.
-  const channelCreds = cfg.useTls
-    ? credentials.createSsl()
-    : credentials.createInsecure();
-
-  // Node-specific gRPC client (not usable in browser envs).
-  const client = new ConcordiumGRPCNodeClient(cfg.host, cfg.port, channelCreds, {
-    timeout: cfg.timeoutMs,
-  });
+  const client = createWebSdkNodeClient(cfg);
 
   try {
     // Cheap ping + a bit of extra info.
-    const health: any = await client.healthCheck();
-    const consensus: any = await client.getConsensusStatus();
+    const anyClient: any = client;
+    const health: any = await anyClient.healthCheck();
+    const consensus: any = await anyClient.getConsensusStatus();
 
     const payload = {
       ok: true,
