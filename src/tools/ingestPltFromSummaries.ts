@@ -1,6 +1,6 @@
 // src/tools/ingestPltFromSummaries.ts
 //
-// M3.3 – PLT ingest skeleton (from transaction-outcome.summaries)
+// M3.3 / M3.4 – PLT ingest skeleton (from transaction-outcome.summaries)
 //
 // This tool is intentionally read-only for now. It:
 //   - Connects to the same Postgres DB as PLT schema + tx summaries
@@ -8,8 +8,10 @@
 //   - Computes counts of summary "tags" (e.g. BlockAccrueReward, etc.)
 //   - Prints a compact JSON snapshot
 //   - Prints a small sample of rows for interesting tags (especially "unknown")
+//   - Calls the PLT extraction skeleton to preview how many PLT events
+//     would be extracted (currently always 0 until we implement it)
 //
-// Later M3.3 steps will add:
+// Later M3.4 steps will add:
 //   - Actual extraction of PLT transfer events from the summary JSON
 //   - Writes into crp_plt_events (idempotent upsert)
 //   - Wiring into the PLT worker
@@ -18,22 +20,23 @@
 //   npm run plt:ingest:summaries
 //
 // Environment (optional):
-//   XCF_PLT_INGEST_LIMIT        – how many recent summaries to inspect (default: 1000)
+//   XCF_PLT_INGEST_LIMIT          – how many recent summaries to inspect (default: 1000)
 //   XCF_PLT_INGEST_SAMPLE_PER_TAG – how many sample rows per tag to show (default: 5)
-//   CRP_DB_CONN_STRING          – full Postgres URL
-//   DATABASE_URL                – fallback Postgres URL
+//   CRP_DB_CONN_STRING            – full Postgres URL
+//   DATABASE_URL                  – fallback Postgres URL
 //
 // Default DB (if no env vars):
 //   postgres://postgres:pg@127.0.0.1:5432/transaction-outcome
 
 import { Client } from "pg";
+import {
+  PltEvent,
+  PltExtractionOptions,
+  RawTxSummaryRow,
+  extractPltEventsFromSummaryRow,
+} from "../plt/pltEvents";
 
-interface TxSummaryRow {
-  id: string;
-  height: string;
-  timestamp: string;
-  summary: unknown;
-}
+type TxSummaryRow = RawTxSummaryRow;
 
 function getConnectionString(): string {
   const conn =
@@ -227,13 +230,45 @@ async function main(): Promise<void> {
       );
     }
 
+    // === NEW: PLT extraction preview (no DB writes) =======================
+    const extractionOptions: PltExtractionOptions = {
+      assetId: "concordium:testnet:PLT:EUDemo",
+      networkGenesisIndex: 6, // testnet
+    };
+
+    const previewEvents: PltEvent[] = [];
+    for (const row of rows) {
+      const events = extractPltEventsFromSummaryRow(row, extractionOptions);
+      if (events.length > 0) {
+        previewEvents.push(...events);
+      }
+    }
+
+    console.log(
+      JSON.stringify(
+        {
+          source: "plt-ingest",
+          step: "extract-preview",
+          limit,
+          totalRows: rows.length,
+          extractedEventCount: previewEvents.length,
+          sampleEvents: previewEvents.slice(0, 10),
+        },
+        null,
+        2
+      )
+    );
+    // =====================================================================
+
     console.log(
       JSON.stringify({
         source: "plt-ingest",
         step: "note",
         note:
-          "M3.3 skeleton: read-only inspection of summaries. " +
-          "PLT event extraction + writes to crp_plt_events will be added once we have a real EUDemo PLT transfer summary to target.",
+          "M3.3 / M3.4 skeleton: read-only inspection of summaries plus PLT " +
+          "extraction preview. PLT event extraction implementation + writes " +
+          "to crp_plt_events will be added once we have a real EUDemo PLT " +
+          "transfer summary to target.",
       })
     );
   } catch (err) {

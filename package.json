@@ -20,6 +20,7 @@
     "smoke:plt:concordium:write": "bash scripts/smoke-crp-plt-concordium-write.sh",
     "smoke:plt:http": "bash scripts/smoke-crp-plt-http.sh",
     "smoke:crp:match-exact": "bash scripts/smoke-crp-payments-exact-match.sh",
+    "smoke:plt:events": "bash scripts/smoke-plt-events.sh",
     "crp:worker:demo": "ts-node src/worker/main.ts",
     "debug:plt:db": "ts-node src/tools/debugPltDb.ts",
     "migration:apply:plt": "ts-node src/tools/applyCrpPltEventsMigration.ts",
