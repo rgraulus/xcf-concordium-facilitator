@@ -27,6 +27,7 @@
     "debug:plt:stream": "ts-node src/tools/debugPltStreamConfig.ts",
     "debug:tx:summary": "ts-node src/tools/debugTxSummary.ts",
     "plt:ingest:summaries": "ts-node src/tools/ingestPltFromSummaries.ts",
+    "plt:ingest:web-sdk": "ts-node src/tools/ingestPltFromTxWebSdk.ts",
     "probe:grpc-node": "ts-node scripts/grpc-node-probe.ts",
     "probe:web-sdk": "ts-node scripts/web-sdk-probe.ts",
     "probe:web-sdk:local": "cross-env CONCORDIUM_GRPC_HOST=127.0.0.1 CONCORDIUM_GRPC_PORT=20100 CONCORDIUM_GRPC_TLS=0 ts-node scripts/web-sdk-probe.ts",
