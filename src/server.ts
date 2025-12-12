@@ -6,6 +6,7 @@
 // - Wires /metrics JSON metrics endpoint
 // - Wires CRP core routes (/v1/crp/*)
 // - Wires PLT search route (/v1/crp/plt/search)
+// - Wires PLT events route (/v1/crp/plt/events)
 // - Wires CRP payments routes (/v1/crp/payments/*)
 
 import fastify, { FastifyInstance } from "fastify";
@@ -16,6 +17,9 @@ import crpRoutes from "./routes/crp";
 
 // PLT search over crp_plt_events (backed by Postgres)
 import crpPltRoute from "./routes/crp.plt";
+
+// PLT events HTTP data-plane routes (/v1/crp/plt/events)
+import pltEventsRoute from "./http/pltEventsRoute";
 
 // Operational readiness (/readyz) – DB + wallet-proxy checks
 import readyzRoute from "./http/readyz";
@@ -45,6 +49,9 @@ export function buildServer(): FastifyInstance {
 
   // PLT search route: /v1/crp/plt/search
   app.register(crpPltRoute);
+
+  // PLT events data-plane route: /v1/crp/plt/events
+  app.register(pltEventsRoute);
 
   // CRP payments routes under /v1/crp/payments/*
   // The plugin itself mounts under /payments, so we prefix it with /v1/crp.

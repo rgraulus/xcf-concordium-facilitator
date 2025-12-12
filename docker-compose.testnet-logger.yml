@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  xcf-tx-logger-testnet:
+    image: concordium/transaction-logger:0.14.0
+    container_name: xcf-tx-logger-testnet
+    restart: unless-stopped
+
+    environment:
+      # Talk to the local node via the host-mapped port.
+      - TRANSACTION_LOGGER_NODES=http://host.docker.internal:20100
+
+      # XCF-facing DB (same as your tools use, via host):
+      - TRANSACTION_LOGGER_DB_STRING=host=host.docker.internal port=5432 dbname=transaction-outcome user=postgres password=pg connect_timeout=10
+
+      - TRANSACTION_LOGGER_MAX_BEHIND_SECONDS=600
+      - TRANSACTION_LOGGER_NUM_PARALLEL_QUERIES=1
+      - TRANSACTION_LOGGER_LOG_LEVEL=info
