@@ -1,12 +1,13 @@
 // src/store/plt.pg.ts
 //
-// Postgres helpers for PLT-related data:
-//   - crp_finalized_blocks
+// Postgres helpers for PLT-related data.
+// Canonical tables (created by migration:apply:plt):
+//   - crp_plt_assets
 //   - crp_plt_events
 //
-// Public API (used by the worker):
-//   - upsertFinalizedBlock(input)
-//   - insertPltTransfers(events)
+// Public API (used by worker and tools):
+//   - insertPltTransfers(events)   // inserts into crp_plt_events (idempotent)
+//   - upsertFinalizedBlock(...)    // kept for future use (optional)
 
 import { Pool } from "pg";
 
@@ -24,19 +25,36 @@ export interface FinalizedBlockRow {
   finalized_at: Date;
 }
 
-export interface PltTransferInsertInput {
-  network: string;
-  token_id: string;
-  tx_hash: string;
-  event_index: number;
+/**
+ * Canonical insert shape for crp_plt_events.
+ * Mirrors the DB columns (no "amount_minor/decimals/token_id" legacy fields).
+ */
+export interface PltEventInsertInput {
+  // Chain location
   block_hash: string;
   block_height: number;
-  from_addr: string | null;
-  to_addr: string | null;
-  amount_minor: string; // minor units, e.g. "1000000" for 1.000000 with 6 decimals
-  decimals: number;
+  transaction_hash: string;
+  event_index: number;
+
+  // Network / rail
+  network: string;
+  network_genesis_index: number;
+  finalized?: boolean;
+
+  // Semantics
+  event_type: string; // e.g. 'transfer'
+  from_address: string | null;
+  to_address: string | null;
+
+  // Amount in atomic units (raw integer)
+  amount_raw: string; // NUMERIC(38,0) as string
+  asset_id: string; // FK -> crp_plt_assets(asset_id)
+
   occurred_at: Date;
 }
+
+// Back-compat alias: older code may still import this name.
+export type PltTransferInsertInput = PltEventInsertInput;
 
 export interface InsertPltTransfersResult {
   inserted: number;
@@ -46,28 +64,34 @@ let pool: Pool | null = null;
 let schemaInitialized = false;
 let schemaInitPromise: Promise<void> | null = null;
 
+function getConnectionString(): string {
+  return (
+    process.env.CRP_DB_CONN_STRING ??
+    process.env.DATABASE_URL ??
+    // Fallback for local xcf-pg (shared with transaction-logger)
+    "postgres://postgres:pg@127.0.0.1:5432/transaction-outcome"
+  );
+}
+
 function getPool(): Pool {
   if (!pool) {
-    const databaseUrl =
-      process.env.DATABASE_URL ??
-      "postgres://postgres:pg@127.0.0.1:5432/postgres";
-
+    const databaseUrl = getConnectionString();
     // eslint-disable-next-line no-console
     console.log("[DB] Using", databaseUrl);
-
     pool = new Pool({ connectionString: databaseUrl });
   }
   return pool;
 }
 
+/**
+ * Keep an idempotent schema guard for local/dev.
+ * (Safe: CREATE TABLE/INDEX IF NOT EXISTS are no-ops if already created.)
+ */
 async function ensureSchema(): Promise<void> {
   if (schemaInitialized) return;
   if (!schemaInitPromise) {
     const p = getPool();
     schemaInitPromise = (async () => {
-      // Idempotent, conservative schema creation. If tables already exist,
-      // these CREATE TABLE IF NOT EXISTS statements are no-ops and we do
-      // not attempt to ALTER anything.
       await p.query(`
         CREATE TABLE IF NOT EXISTS crp_finalized_blocks (
           block_hash   TEXT        NOT NULL,
@@ -79,21 +103,68 @@ async function ensureSchema(): Promise<void> {
       `);
 
       await p.query(`
-        CREATE TABLE IF NOT EXISTS crp_plt_events (
-          id           BIGSERIAL PRIMARY KEY,
-          network      TEXT        NOT NULL,
-          token_id     TEXT        NOT NULL,
-          tx_hash      TEXT        NOT NULL,
-          event_index  INTEGER     NOT NULL,
-          block_hash   TEXT        NOT NULL,
-          block_height BIGINT      NOT NULL,
-          from_addr    TEXT,
-          to_addr      TEXT,
-          amount_minor TEXT        NOT NULL,
-          decimals     INTEGER     NOT NULL,
-          occurred_at  TIMESTAMPTZ NOT NULL,
-          inserted_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        CREATE TABLE IF NOT EXISTS crp_plt_assets (
+          asset_id TEXT PRIMARY KEY,
+          symbol TEXT NOT NULL,
+          decimals INTEGER NOT NULL,
+          description TEXT,
+          enabled BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
+      `);
+
+      await p.query(`
+        CREATE TABLE IF NOT EXISTS crp_plt_events (
+          id BIGSERIAL PRIMARY KEY,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+          -- Chain location
+          block_hash TEXT NOT NULL,
+          block_height BIGINT NOT NULL,
+          transaction_hash TEXT NOT NULL,
+          event_index INTEGER NOT NULL,
+
+          -- Network / rail
+          network TEXT NOT NULL,
+          network_genesis_index INTEGER NOT NULL,
+          finalized BOOLEAN NOT NULL DEFAULT TRUE,
+
+          -- Semantics
+          event_type TEXT NOT NULL,
+          from_address TEXT,
+          to_address TEXT,
+
+          -- Amount
+          amount_raw NUMERIC(38, 0) NOT NULL,
+          asset_id TEXT NOT NULL REFERENCES crp_plt_assets(asset_id),
+
+          occurred_at TIMESTAMPTZ NOT NULL,
+
+          -- One row per on-chain event
+          UNIQUE (transaction_hash, event_index)
+        )
+      `);
+
+      await p.query(`
+        CREATE INDEX IF NOT EXISTS crp_plt_events_block_height_idx
+          ON crp_plt_events (block_height);
+      `);
+
+      await p.query(`
+        CREATE INDEX IF NOT EXISTS crp_plt_events_tx_hash_idx
+          ON crp_plt_events (transaction_hash);
+      `);
+
+      await p.query(`
+        CREATE INDEX IF NOT EXISTS crp_plt_events_to_addr_amount_idx
+          ON crp_plt_events (to_address, asset_id, amount_raw);
+      `);
+
+      await p.query(`
+        CREATE INDEX IF NOT EXISTS crp_plt_events_network_height_idx
+          ON crp_plt_events (network, block_height);
       `);
 
       schemaInitialized = true;
@@ -140,13 +211,12 @@ export async function upsertFinalizedBlock(
 }
 
 /**
- * Insert one or more PLT transfer rows into crp_plt_events.
+ * Insert one or more PLT event rows into crp_plt_events.
  *
- * We explicitly include block_height because the existing schema
- * has this column as NOT NULL.
+ * Idempotent: ON CONFLICT (transaction_hash, event_index) DO NOTHING
  */
 export async function insertPltTransfers(
-  events: PltTransferInsertInput[]
+  events: PltEventInsertInput[]
 ): Promise<InsertPltTransfersResult> {
   if (events.length === 0) {
     return { inserted: 0 };
@@ -159,41 +229,58 @@ export async function insertPltTransfers(
   const chunks: string[] = [];
 
   events.forEach((ev, idx) => {
-    const base = idx * 11;
+    const base = idx * 14;
+
     chunks.push(
-      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11})`
+      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11}, $${base + 12}, $${base + 13}, $${base + 14})`
     );
 
     values.push(
-      ev.network,
-      ev.token_id,
-      ev.tx_hash,
-      ev.event_index,
       ev.block_hash,
       ev.block_height,
-      ev.from_addr,
-      ev.to_addr,
-      ev.amount_minor,
-      ev.decimals,
-      ev.occurred_at
+      ev.transaction_hash,
+      ev.event_index,
+
+      ev.network,
+      ev.network_genesis_index,
+      ev.finalized ?? true,
+
+      ev.event_type,
+      ev.from_address,
+      ev.to_address,
+
+      ev.amount_raw,
+      ev.asset_id,
+
+      ev.occurred_at,
+      new Date() // updated_at
     );
   });
 
   const sql = `
     INSERT INTO crp_plt_events (
-      network,
-      token_id,
-      tx_hash,
-      event_index,
       block_hash,
       block_height,
-      from_addr,
-      to_addr,
-      amount_minor,
-      decimals,
-      occurred_at
+      transaction_hash,
+      event_index,
+
+      network,
+      network_genesis_index,
+      finalized,
+
+      event_type,
+      from_address,
+      to_address,
+
+      amount_raw,
+      asset_id,
+
+      occurred_at,
+      updated_at
     )
     VALUES ${chunks.join(", ")}
+    ON CONFLICT (transaction_hash, event_index)
+    DO NOTHING
   `;
 
   const res = await p.query(sql, values);

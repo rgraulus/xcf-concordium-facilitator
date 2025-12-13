@@ -1,18 +1,16 @@
 // src/worker/pltSource.concordium.ts
 //
-// Concordium PLT event source backed by the wallet-proxy /v3/accTransactions
-// endpoint. This replaces the earlier "stub" implementation which always
-// returned 0 events.
+// Concordium PLT event source backed by wallet-proxy /v3/accTransactions.
 //
-// The worker treats the "height" as a monotonically increasing cursor. Here we
-// use the wallet-proxy transaction `id` as that cursor, since the README
-// specifies that `id` is a stable, ordered identifier and `from` means
-// "transactions with higher ids than this" when order is ascending.
+// Cursor model:
+// - We treat "height" as a monotonically increasing cursor.
+// - We use wallet-proxy transaction `id` as that cursor.
+// - When `order=ascending`, wallet-proxy treats `from` as "ids > from".
 //
-// We scan transactions for a single account (CRP_STREAM_ACCOUNT) and
-// heuristically select PLT-related ones based on `details.type` and
-// `details.events`. Amounts remain stubbed for now; this will be refined once
-// structured PLT transfer data is exposed.
+// This produces *canonical* events compatible with crp_plt_events:
+// - transaction_hash, event_index, asset_id, amount_raw, occurred_at, etc.
+//
+// Amounts are still stubbed ("0") until we have structured PLT transfer data.
 
 import { getAccountTransactions } from "../services/walletProxyClient";
 
@@ -24,92 +22,80 @@ export interface ConcordiumNodeConfig {
 
   /**
    * Logical network name, e.g. "concordium:testnet".
+   * Stored into crp_plt_events.network.
    */
   network: string;
 
   /**
-   * Logical tokenId filter for PLT, e.g. "EUDemo" or "usd:test".
-   * For now this is used only for tagging events; we do not yet filter
-   * on-chain data by token id.
+   * Network genesis index, e.g. 6 for Concordium testnet (as seen in /consensus).
+   * Stored into crp_plt_events.network_genesis_index.
    */
-  logicalTokenId: string;
+  networkGenesisIndex: number;
+
+  /**
+   * Asset id / token id for PLT, e.g. "EUDemo".
+   * Stored into crp_plt_events.asset_id.
+   */
+  assetId: string;
 }
 
 /**
- * Normalized PLT transfer event as seen by the worker.
+ * Canonical PLT transfer-ish event shape emitted by the source.
  */
 export interface ExtractedPltEvent {
   network: string;
+  networkGenesisIndex: number;
+
   blockHash: string;
   blockHeight: number;
-  txHash: string;
-  tokenId: string;
-  amountMinor: string;
-  from: string | null;
-  to: string;
-  occurredAt: Date;
+
+  transactionHash: string;
   eventIndex: number;
+
+  eventType: string; // e.g. 'transfer'
+  fromAddress: string | null;
+  toAddress: string | null;
+
+  amountRaw: string; // atomic integer as string
+  assetId: string;
+
+  occurredAt: Date;
+  finalized: boolean;
 }
 
-/**
- * Summary of a single scan step, similar in spirit to the earlier stubbed
- * "latest-block sample" logging.
- */
 export interface ConcordiumPltScanSummary {
   network: string;
-  tokenIdFilter: string;
-  blockHash: string | null;
-  blockHeight: number | null;
+  assetId: string;
+  networkGenesisIndex: number;
+
+  cursorFrom: number;
+  cursorBest: number;
+
   totalSummaries: number;
   matchedEvents: number;
-  sampleSummaries: unknown[];
+
   sampleEvents: Array<{
-    network: string;
-    blockHash: string;
+    transactionHash: string;
     blockHeight: number;
-    txHash: string;
-    tokenId: string;
-    amount: string;
-    from: string | null;
-    to: string;
+    assetId: string;
+    amountRaw: string;
+    fromAddress: string | null;
+    toAddress: string | null;
   }>;
 }
 
-/**
- * Result of a scan step.
- */
 export interface ConcordiumPltSourceResult {
   events: ExtractedPltEvent[];
-  /**
-   * Best (highest) transaction id we've seen in this scan. The worker uses this
-   * as the next `lastHeightExclusive` when polling again.
-   */
-  bestHeight: number;
+  bestHeight: number; // wallet-proxy tx `id`
   summary: ConcordiumPltScanSummary;
 }
 
 export class ConcordiumPltSource {
   constructor(public readonly config: ConcordiumNodeConfig) {}
 
-  /**
-   * Fetch PLT-related events strictly above `lastHeightExclusive`, where
-   * "height" here is the wallet-proxy transaction `id`.
-   *
-   * We call wallet-proxy /v3/accTransactions with:
-   *   - order=ascending
-   *   - from=lastHeightExclusive (proxy returns ids > this when ascending)
-   *   - limit=some sane page size
-   *
-   * We then:
-   *   - compute `bestHeight` as the max `id` among all returned txs
-   *   - heuristically select PLT-related txs as events
-   */
-  async fetchSince(
-    lastHeightExclusive: number
-  ): Promise<ConcordiumPltSourceResult> {
-    const { accountAddress, network, logicalTokenId } = this.config;
+  async fetchSince(lastHeightExclusive: number): Promise<ConcordiumPltSourceResult> {
+    const { accountAddress, network, networkGenesisIndex, assetId } = this.config;
 
-    // Sane page size; we only run this in a demo/worker context right now.
     const limit = 100;
 
     let resp;
@@ -121,18 +107,13 @@ export class ConcordiumPltSource {
         includeRewards: "none",
       });
     } catch (err) {
-      console.error(
-        "[CRP-STREAM][concordium] wallet-proxy request failed:",
-        err
-      );
+      console.error("[CRP-STREAM][concordium] wallet-proxy request failed:", err);
       throw err;
     }
 
     const txs = resp.transactions ?? [];
 
-    // Compute the bestHeight as the highest transaction id we've seen,
-    // even if none of the transactions turn into PLT events. This ensures
-    // we make forward progress and don't re-scan the same range repeatedly.
+    // Forward progress cursor
     let bestHeight = lastHeightExclusive;
     for (const tx of txs) {
       if (typeof tx.id === "number" && tx.id > bestHeight) {
@@ -151,107 +132,102 @@ export class ConcordiumPltSource {
         ? details.events.map((e: unknown) => String(e))
         : [];
 
-      // Heuristic: treat PLT-related transactions as:
-      // - those with PLT-specific types in v3 ("updateCreatePLT", "tokenGovernance", "tokenHolder"), or
-      // - those whose localized event descriptions mention "PLT".
+      // Heuristic for "PLT-ish" activity (still coarse)
       const isPltTx =
         detailsType === "updateCreatePLT" ||
         detailsType === "tokenGovernance" ||
         detailsType === "tokenHolder" ||
         detailsEvents.some((e: string) => e.toLowerCase().includes("plt"));
 
-      if (!isPltTx) {
-        continue;
-      }
+      if (!isPltTx) continue;
 
       const txId =
-        typeof tx.id === "number" && Number.isFinite(tx.id)
-          ? tx.id
-          : bestHeight;
+        typeof tx.id === "number" && Number.isFinite(tx.id) ? tx.id : bestHeight;
 
       const blockHash = String((tx as any).blockHash ?? "");
       const blockHeight = Number((tx as any).blockHeight ?? 0);
-      const txHash = tx.transactionHash ?? `id:${txId}`;
 
-      // TODO: Once wallet-proxy (or Concordium SDK) exposes structured PLT
-      // transfer amounts, map that here. For now we store "0" as a placeholder
-      // to keep the schema happy.
-      const amountMinor = "0";
+      const transactionHash = tx.transactionHash ?? `id:${txId}`;
+      const eventIndex = 0;
 
-      const from =
-        typeof details.transferSource === "string"
-          ? details.transferSource
-          : null;
-      const to =
+      const fromAddress =
+        typeof details.transferSource === "string" ? details.transferSource : null;
+      const toAddress =
         typeof details.transferDestination === "string"
           ? details.transferDestination
           : accountAddress;
 
-      const occurredAt = new Date(Number(tx.blockTime) * 1000);
-      const eventIndex = 0;
+      const occurredAt =
+        typeof tx.blockTime === "number" && Number.isFinite(tx.blockTime)
+          ? new Date(tx.blockTime * 1000)
+          : new Date();
 
-      events.push({
+      // TODO: replace with real PLT amount extraction once available
+      const amountRaw = "0";
+
+      const ev: ExtractedPltEvent = {
         network,
+        networkGenesisIndex,
+
         blockHash,
         blockHeight,
-        txHash,
-        tokenId: logicalTokenId,
-        amountMinor,
-        from,
-        to,
-        occurredAt,
+
+        transactionHash,
         eventIndex,
-      });
+
+        eventType: "transfer",
+        fromAddress,
+        toAddress,
+
+        amountRaw,
+        assetId,
+
+        occurredAt,
+        finalized: true,
+      };
+
+      events.push(ev);
 
       if (sampleEvents.length < 3) {
         sampleEvents.push({
-          network,
-          blockHash,
-          blockHeight,
-          txHash,
-          tokenId: logicalTokenId,
-          amount: amountMinor,
-          from,
-          to,
+          transactionHash: ev.transactionHash,
+          blockHeight: ev.blockHeight,
+          assetId: ev.assetId,
+          amountRaw: ev.amountRaw,
+          fromAddress: ev.fromAddress,
+          toAddress: ev.toAddress,
         });
       }
     }
 
-    const lastTx = txs.length > 0 ? (txs[txs.length - 1] as any) : undefined;
-
     const summary: ConcordiumPltScanSummary = {
       network,
-      tokenIdFilter: logicalTokenId,
-      blockHash: lastTx ? String(lastTx.blockHash ?? "") : null,
-      blockHeight: lastTx
-        ? Number(lastTx.blockHeight ?? bestHeight)
-        : bestHeight,
+      assetId,
+      networkGenesisIndex,
+      cursorFrom: lastHeightExclusive,
+      cursorBest: bestHeight,
       totalSummaries: txs.length,
       matchedEvents: events.length,
-      sampleSummaries: [],
       sampleEvents,
     };
 
     console.log("[CRP-STREAM][concordium] wallet-proxy scan", summary);
 
-    return {
-      events,
-      bestHeight,
-      summary,
-    };
+    return { events, bestHeight, summary };
   }
 }
 
-/**
- * Helper to build a config from environment variables.
- *
- * We no longer depend on CONCORDIUM_NODE_URL here; the PLT source is backed
- * by wallet-proxy instead. We still keep the "Concordium*" naming so the
- * worker wiring (M3) remains unchanged.
- */
+function parseIntEnv(name: string, defaultValue: number): number {
+  const raw = process.env[name];
+  if (!raw || raw.trim() === "") return defaultValue;
+  const v = Number.parseInt(raw, 10);
+  return Number.isFinite(v) ? v : defaultValue;
+}
+
 export function createConcordiumNodeConfigFromEnv(): ConcordiumNodeConfig {
   const network = process.env.CRP_STREAM_NETWORK ?? "concordium:testnet";
-  const logicalTokenId =
+
+  const assetId =
     process.env.CONCORDIUM_PLT_TOKEN_ID ??
     process.env.CRP_STREAM_TOKEN_ID ??
     "EUDemo";
@@ -268,16 +244,24 @@ export function createConcordiumNodeConfigFromEnv(): ConcordiumNodeConfig {
     );
   }
 
+  // Default to what we’ve observed on your local testnet node.
+  const networkGenesisIndex = parseIntEnv(
+    "CRP_STREAM_NETWORK_GENESIS_INDEX",
+    parseIntEnv("CONCORDIUM_NETWORK_GENESIS_INDEX", 6)
+  );
+
   const config: ConcordiumNodeConfig = {
     accountAddress,
     network,
-    logicalTokenId,
+    networkGenesisIndex,
+    assetId,
   };
 
   console.log("[CRP-STREAM][concordium] Using wallet-proxy-backed source", {
     accountAddress: config.accountAddress,
     network: config.network,
-    logicalTokenId: config.logicalTokenId,
+    networkGenesisIndex: config.networkGenesisIndex,
+    assetId: config.assetId,
   });
 
   return config;
