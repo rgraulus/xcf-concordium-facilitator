@@ -1,0 +1,29 @@
+services:
+  wallet-proxy:
+    container_name: xcf-wallet-proxy
+    image: concordium/wallet-proxy:0.41.1-0
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./:/config:ro
+    environment:
+      # required by /docker-entrypoint.sh
+      GRPC_HOST: host.docker.internal
+      GRPC_PORT: "20001"
+
+      IP_DATA_FILE: /config/identity-providers-with-metadata.json
+      IP_DATA_FILE_V1: /config/identity-providers-with-metadata-v1.json
+      IP_DATA_FILE_V2: /config/identity-providers-with-metadata-v2.json
+
+      DB_HOST: host.docker.internal
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_NAME: transaction-outcome
+      DB_PASSWORD: pg
+
+      # optional knobs (safe defaults)
+      USE_TLS: "false"
+      LOG_LEVEL: info
+      GRPC_TIMEOUT: "15"
+      GRPC_RETRY: "0"

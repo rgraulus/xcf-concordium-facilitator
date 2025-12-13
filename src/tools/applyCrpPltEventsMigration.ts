@@ -33,29 +33,23 @@ async function main(): Promise<void> {
   await client.connect();
 
   try {
-    console.log(
-      JSON.stringify({
-        source: "plt-migration",
-        step: "begin",
-      })
-    );
-
+    console.log(JSON.stringify({ source: "plt-migration", step: "begin" }));
     await client.query("BEGIN;");
 
     // 1) Asset / decimals registry
     await client.query(`
       CREATE TABLE IF NOT EXISTS crp_plt_assets (
-        asset_id TEXT PRIMARY KEY,
-        symbol TEXT NOT NULL,
-        decimals INTEGER NOT NULL,
+        asset_id   TEXT PRIMARY KEY,
+        symbol     TEXT NOT NULL,
+        decimals   INTEGER NOT NULL,
         description TEXT,
-        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        enabled    BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
 
-    // 2) Raw PLT transfer events
+    // 2) Raw PLT transfer events (canonical)
     await client.query(`
       CREATE TABLE IF NOT EXISTS crp_plt_events (
         id BIGSERIAL PRIMARY KEY,
@@ -63,23 +57,27 @@ async function main(): Promise<void> {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
         -- Chain location
-        block_hash TEXT NOT NULL,
-        block_height BIGINT NOT NULL,
-        transaction_hash TEXT NOT NULL,
-        event_index INTEGER NOT NULL,
+        block_hash       TEXT   NOT NULL,
+        block_height     BIGINT NOT NULL,
+        transaction_hash TEXT   NOT NULL,
+        event_index      INTEGER NOT NULL,
+
+        -- Network / rail
+        network               TEXT    NOT NULL,         -- e.g. "concordium:testnet"
+        network_genesis_index INTEGER NOT NULL,         -- e.g. 6 (testnet)
+        finalized             BOOLEAN NOT NULL DEFAULT TRUE,
 
         -- Semantics
-        event_type TEXT NOT NULL, -- e.g. 'transfer', 'mint', 'burn'
-        from_address TEXT,
-        to_address TEXT,
+        event_type    TEXT NOT NULL, -- e.g. 'transfer', 'mint', 'burn'
+        from_address  TEXT,
+        to_address    TEXT,
 
         -- Amount in atomic units (raw integer)
         amount_raw NUMERIC(38, 0) NOT NULL,
-        asset_id TEXT NOT NULL REFERENCES crp_plt_assets(asset_id),
+        asset_id    TEXT NOT NULL REFERENCES crp_plt_assets(asset_id),
 
-        -- Network / rail
-        network_genesis_index INTEGER NOT NULL,
-        finalized BOOLEAN NOT NULL DEFAULT TRUE,
+        -- Chain timestamp (preferred over created_at)
+        occurred_at TIMESTAMPTZ NOT NULL,
 
         -- One row per on-chain event
         UNIQUE (transaction_hash, event_index)
@@ -100,6 +98,11 @@ async function main(): Promise<void> {
     await client.query(`
       CREATE INDEX IF NOT EXISTS crp_plt_events_to_addr_amount_idx
         ON crp_plt_events (to_address, asset_id, amount_raw);
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS crp_plt_events_network_height_idx
+        ON crp_plt_events (network, block_height);
     `);
 
     await client.query("COMMIT;");

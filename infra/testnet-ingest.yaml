@@ -26,6 +26,7 @@ services:
     ports:
       - "8889:8889"
       - "20001:20001"
+      - "10001:10001"  
     volumes:
       - concordium-testnet-data:/mnt/data
 
