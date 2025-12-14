@@ -7,16 +7,18 @@
 // - We use wallet-proxy transaction `id` as that cursor.
 // - When `order=ascending`, wallet-proxy treats `from` as "ids > from".
 //
-// This produces *canonical* events compatible with crp_plt_events:
-// - transaction_hash, event_index, asset_id, amount_raw, occurred_at, etc.
-//
-// Amounts are still stubbed ("0") until we have structured PLT transfer data.
+// NOTE on account address format:
+// In your setup, wallet-proxy rejects strings that start with "ccd1" and
+// accepts the base58-looking form (e.g. "2yV8...").
+// To be user-friendly, we allow either:
+//   - "2yV8..."          (passes through)
+//   - "ccd12yV8..."      (we strip leading "ccd1" -> "2yV8...")
 
-import { getAccountTransactions } from "../services/walletProxyClient";
+import { getAccountTransactions as getAccountTransactionsImported } from "../services/walletProxyClient";
 
 export interface ConcordiumNodeConfig {
   /**
-   * Account whose CCD/PLT history we scan via wallet-proxy.
+   * Account address to scan (in the format wallet-proxy accepts).
    */
   accountAddress: string;
 
@@ -39,9 +41,6 @@ export interface ConcordiumNodeConfig {
   assetId: string;
 }
 
-/**
- * Canonical PLT transfer-ish event shape emitted by the source.
- */
 export interface ExtractedPltEvent {
   network: string;
   networkGenesisIndex: number;
@@ -90,6 +89,12 @@ export interface ConcordiumPltSourceResult {
   summary: ConcordiumPltScanSummary;
 }
 
+// Make this robust to different TS typings of walletProxyClient.
+// (At runtime, extra args are harmless even if the function ignores them.)
+type GetAccountTransactionsFn = (...args: any[]) => Promise<any>;
+const getAccountTransactions: GetAccountTransactionsFn =
+  getAccountTransactionsImported as unknown as GetAccountTransactionsFn;
+
 export class ConcordiumPltSource {
   constructor(public readonly config: ConcordiumNodeConfig) {}
 
@@ -98,12 +103,13 @@ export class ConcordiumPltSource {
 
     const limit = 100;
 
-    let resp;
+    let resp: any;
     try {
+      // IMPORTANT: walletProxyClient expects the account address as a string param.
       resp = await getAccountTransactions(accountAddress, {
+        from: lastHeightExclusive,
         limit,
         order: "ascending",
-        from: lastHeightExclusive > 0 ? lastHeightExclusive : undefined,
         includeRewards: "none",
       });
     } catch (err) {
@@ -111,12 +117,12 @@ export class ConcordiumPltSource {
       throw err;
     }
 
-    const txs = resp.transactions ?? [];
+    const txs: any[] = resp?.transactions ?? [];
 
-    // Forward progress cursor
+    // Forward progress cursor (wallet-proxy tx id)
     let bestHeight = lastHeightExclusive;
     for (const tx of txs) {
-      if (typeof tx.id === "number" && tx.id > bestHeight) {
+      if (typeof tx?.id === "number" && tx.id > bestHeight) {
         bestHeight = tx.id;
       }
     }
@@ -125,11 +131,10 @@ export class ConcordiumPltSource {
     const sampleEvents: ConcordiumPltScanSummary["sampleEvents"] = [];
 
     for (const tx of txs) {
-      const details = (tx.details ?? {}) as any;
-
-      const detailsType = String(details.type ?? "");
-      const detailsEvents = Array.isArray(details.events)
-        ? details.events.map((e: unknown) => String(e))
+      const details: any = tx?.details ?? {};
+      const detailsType = String(details?.type ?? "");
+      const detailsEvents: string[] = Array.isArray(details?.events)
+        ? details.events.map((e: any) => String(e))
         : [];
 
       // Heuristic for "PLT-ish" activity (still coarse)
@@ -142,23 +147,23 @@ export class ConcordiumPltSource {
       if (!isPltTx) continue;
 
       const txId =
-        typeof tx.id === "number" && Number.isFinite(tx.id) ? tx.id : bestHeight;
+        typeof tx?.id === "number" && Number.isFinite(tx.id) ? tx.id : bestHeight;
 
-      const blockHash = String((tx as any).blockHash ?? "");
-      const blockHeight = Number((tx as any).blockHeight ?? 0);
+      const blockHash = String(tx?.blockHash ?? "");
+      const blockHeight = Number(tx?.blockHeight ?? 0);
 
-      const transactionHash = tx.transactionHash ?? `id:${txId}`;
+      const transactionHash = String(tx?.transactionHash ?? `id:${txId}`);
       const eventIndex = 0;
 
       const fromAddress =
-        typeof details.transferSource === "string" ? details.transferSource : null;
+        typeof details?.transferSource === "string" ? details.transferSource : null;
       const toAddress =
-        typeof details.transferDestination === "string"
+        typeof details?.transferDestination === "string"
           ? details.transferDestination
-          : accountAddress;
+          : null;
 
       const occurredAt =
-        typeof tx.blockTime === "number" && Number.isFinite(tx.blockTime)
+        typeof tx?.blockTime === "number" && Number.isFinite(tx.blockTime)
           ? new Date(tx.blockTime * 1000)
           : new Date();
 
@@ -224,6 +229,20 @@ function parseIntEnv(name: string, defaultValue: number): number {
   return Number.isFinite(v) ? v : defaultValue;
 }
 
+function normalizeAccountForWalletProxy(inputRaw: string): { normalized: string; note?: string } {
+  const input = (inputRaw ?? "").trim();
+  if (!input) return { normalized: "" };
+
+  if (input.startsWith("ccd1") && input.length > 4) {
+    return {
+      normalized: input.slice(4),
+      note: `Stripped leading "ccd1" (wallet-proxy in this setup expects the base58 form).`,
+    };
+  }
+
+  return { normalized: input };
+}
+
 export function createConcordiumNodeConfigFromEnv(): ConcordiumNodeConfig {
   const network = process.env.CRP_STREAM_NETWORK ?? "concordium:testnet";
 
@@ -232,23 +251,24 @@ export function createConcordiumNodeConfigFromEnv(): ConcordiumNodeConfig {
     process.env.CRP_STREAM_TOKEN_ID ??
     "EUDemo";
 
-  const accountAddress =
-    process.env.CRP_STREAM_ACCOUNT ??
-    process.env.CRP_STREAM_PAYTO_ACCOUNT ??
-    process.env.CRP_STREAM_ACCOUNT_ADDRESS;
+  const rawAccountAddress = process.env.CRP_STREAM_ACCOUNT ?? "";
+  const { normalized: accountAddress, note } = normalizeAccountForWalletProxy(rawAccountAddress);
 
-  if (!accountAddress || accountAddress.trim() === "") {
+  if (!accountAddress) {
     throw new Error(
-      "CRP_STREAM_ACCOUNT (or CRP_STREAM_PAYTO_ACCOUNT / CRP_STREAM_ACCOUNT_ADDRESS) " +
-        "is required for the concordium PLT source (wallet-proxy account address)."
+      "CRP_STREAM_ACCOUNT is required (wallet-proxy-accepted format). " +
+        'Example: "2yV8..." (if you accidentally used "ccd1...", the worker will strip it).'
     );
   }
 
-  // Default to what we’ve observed on your local testnet node.
   const networkGenesisIndex = parseIntEnv(
     "CRP_STREAM_NETWORK_GENESIS_INDEX",
     parseIntEnv("CONCORDIUM_NETWORK_GENESIS_INDEX", 6)
   );
+
+  if (note) {
+    console.log("[CRP-STREAM][concordium] NOTE:", note);
+  }
 
   const config: ConcordiumNodeConfig = {
     accountAddress,
