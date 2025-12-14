@@ -1,0 +1,50 @@
+[
+  {
+    "cursor": 1,
+    "network": "concordium:testnet",
+    "networkGenesisIndex": 6,
+    "blockHash": "fixture-block-1",
+    "blockHeight": 1,
+    "transactionHash": "fixture-tx-1",
+    "eventIndex": 0,
+    "eventType": "transfer",
+    "fromAddress": "ccd1fixturefromaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "toAddress": "ccd1fixturetooooooooooooooooooooooooooooooooooooo",
+    "amountRaw": "123456",
+    "assetId": "EUDemo",
+    "occurredAt": "2025-12-14T04:24:38.686Z",
+    "finalized": true
+  },
+  {
+    "cursor": 2,
+    "network": "concordium:testnet",
+    "networkGenesisIndex": 6,
+    "blockHash": "fixture-block-2",
+    "blockHeight": 2,
+    "transactionHash": "fixture-tx-2",
+    "eventIndex": 0,
+    "eventType": "transfer",
+    "fromAddress": "ccd1fixturefrombbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "toAddress": "ccd1fixturetooooooooooooooooooooooooooooooooooooo",
+    "amountRaw": "999999",
+    "assetId": "EUDemo",
+    "occurredAt": "2025-12-14T04:25:38.686Z",
+    "finalized": true
+  },
+  {
+    "cursor": 3,
+    "network": "concordium:testnet",
+    "networkGenesisIndex": 6,
+    "blockHash": "fixture-block-3",
+    "blockHeight": 3,
+    "transactionHash": "fixture-tx-3",
+    "eventIndex": 1,
+    "eventType": "transfer",
+    "fromAddress": null,
+    "toAddress": "ccd1fixturetooooooooooooooooooooooooooooooooooooo",
+    "amountRaw": "42",
+    "assetId": "EUDemo",
+    "occurredAt": "2025-12-14T04:26:38.686Z",
+    "finalized": true
+  }
+]
