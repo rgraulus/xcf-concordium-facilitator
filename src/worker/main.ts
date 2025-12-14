@@ -1,26 +1,18 @@
-// src/worker/main.ts
-//
-// M3 CRP stream worker (PLT-focused).
-//
-// Polls a PLT source (wallet-proxy-backed Concordium source) and writes
-// canonical PLT events into Postgres via crp_plt_events.
-
 import "dotenv/config";
 
 import {
   createConcordiumNodeConfigFromEnv,
   ConcordiumPltSource,
 } from "./pltSource.concordium";
+import { createFixtureSourceFromEnv } from "./pltSource.fixture";
+import { PltSource } from "./pltSource.types";
 
-import {
-  insertPltTransfers,
-  PltEventInsertInput,
-} from "../store/plt.pg";
+import { insertPltTransfers, PltEventInsertInput } from "../store/plt.pg";
 
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_MAX_TICKS = 3;
 
-type SourceKind = "concordium";
+type SourceKind = "concordium" | "fixture";
 
 interface WorkerConfig {
   pollIntervalMs: number;
@@ -31,16 +23,11 @@ interface WorkerConfig {
 }
 
 function loadWorkerConfigFromEnv(): WorkerConfig {
-  const pollIntervalMs = Number(
-    process.env.CRP_STREAM_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS
-  );
+  const pollIntervalMs = Number(process.env.CRP_STREAM_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS);
   const maxTicks = Number(process.env.CRP_STREAM_MAX_TICKS ?? DEFAULT_MAX_TICKS);
-  const dryRun =
-    process.env.CRP_STREAM_DRY_RUN === "1" ||
-    process.env.CRP_STREAM_DRY_RUN === "true";
+  const dryRun = process.env.CRP_STREAM_DRY_RUN === "1" || process.env.CRP_STREAM_DRY_RUN === "true";
   const lastHeight = Number(process.env.CRP_STREAM_LAST_HEIGHT ?? 0);
-  const sourceKind: SourceKind =
-    (process.env.CRP_STREAM_SOURCE as SourceKind) ?? "concordium";
+  const sourceKind: SourceKind = (process.env.CRP_STREAM_SOURCE as SourceKind) ?? "concordium";
 
   return { pollIntervalMs, dryRun, lastHeight, maxTicks, sourceKind };
 }
@@ -50,7 +37,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function runWorker(
-  source: ConcordiumPltSource,
+  source: PltSource,
   cfg: WorkerConfig,
   state: { lastHeightExclusive: number }
 ): Promise<void> {
@@ -103,7 +90,6 @@ async function runWorker(
 
       if (!cfg.dryRun) {
         const { inserted } = await insertPltTransfers(rows);
-
         const last = rows[rows.length - 1];
         console.log("[CRP-STREAM] inserted PLT events:", {
           inserted,
@@ -138,17 +124,16 @@ export async function runDemo(): Promise<void> {
     sourceKind: cfg.sourceKind,
   });
 
-  if (cfg.sourceKind !== "concordium") {
-    throw new Error(
-      `Unsupported CRP_STREAM_SOURCE="${cfg.sourceKind}". Expected "concordium".`
-    );
+  let source: PltSource;
+
+  if (cfg.sourceKind === "fixture") {
+    source = createFixtureSourceFromEnv();
+  } else {
+    const nodeCfg = createConcordiumNodeConfigFromEnv();
+    source = new ConcordiumPltSource(nodeCfg);
   }
 
-  const nodeConfig = createConcordiumNodeConfigFromEnv();
-  const source = new ConcordiumPltSource(nodeConfig);
-
   const state = { lastHeightExclusive: cfg.lastHeight };
-
   await runWorker(source, cfg, state);
 }
 
