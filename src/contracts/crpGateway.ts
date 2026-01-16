@@ -1,3 +1,4 @@
+// src/contracts/crpGateway.ts
 // Canonical TypeScript types for the CRP ↔ Gateway HTTP contract.
 // These are the shapes used on the wire by /v1/crp/payments* and the webhook.
 
@@ -6,8 +7,8 @@ export type CrpNetwork = "concordium:testnet"; // Extend when more networks are 
 // Asset as used in requests and responses.
 export interface CrpAsset {
   type: "PLT";       // PoC: only PLT (protocol-level token).
-  tokenId: string;   // e.g. "usd:test".
-  decimals: number;  // e.g. 2.
+  tokenId: string;   // e.g. "EUDemo".
+  decimals: number;  // e.g. 6.
 }
 
 // === Requests ===
@@ -19,7 +20,7 @@ export interface CrpChallengeCreateRequest {
   network: CrpNetwork;
   asset: CrpAsset;
   amount: string; // Decimal string, e.g. "25.00".
-  payTo: string;  // Concordium address (testnet for now).
+  payTo: string;  // Concordium address.
   expiry?: string; // ISO-8601 or omitted.
   policy?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
@@ -38,20 +39,32 @@ export interface CrpMatchRequest {
 // Fulfill request shares the same tuple as match.
 export type CrpFulfillRequest = CrpMatchRequest;
 
-// === Receipt ===
+// === Receipt (Canonical: aligns to schemas/receipt.schema.json) ===
 
-export interface CrpReceiptPayload {
-  nonce: string;
-  amount: string;
-  network: CrpNetwork;
-  asset: CrpAsset;
-  paidTo: string;
-  finalizedAt: string; // ISO-8601.
+export interface CrpReceiptPayloadV1 {
+  v: "1";
+  challenge_nonce: string;
+  network: string; // schema: ^concordium:(testnet|mainnet)$
+  asset: {
+    type: "PLT";
+    tokenId: string;
+    decimals: number;
+  };
+  amount: string; // decimal string
+  from: string;
+  to: string;
+  tx_hash: string;
+  block_hash: string;
+  finalized_at: string; // date-time
+  compliance: Record<string, unknown>;
+  facilitator_sig: string;     // we'll store the compact JWS here
+  facilitator_key_id: string;  // kid
 }
 
+// What we store/return on the payment record.
 export interface CrpReceipt {
-  jws: string;                 // Compact JWS (header.payload.signature).
-  payload: CrpReceiptPayload;  // Decoded payload for convenience.
+  jws: string;                 // compact JWS (header.payload.signature)
+  payload: CrpReceiptPayloadV1; // canonical payload (includes facilitator_sig + key id)
 }
 
 // === Payment record (as returned in responses & webhook) ===
@@ -77,7 +90,6 @@ export interface CrpPaymentRecord {
 
 // === Webhook support ===
 
-// Internal representation of the webhook attempt result, surfaced in responses.
 export interface CrpWebhookResult {
   configured: boolean;
   attempted: boolean;
@@ -86,7 +98,6 @@ export interface CrpWebhookResult {
   error?: string;
 }
 
-// Webhook payload from XCF (CRP) to Gateway.
 export interface CrpWebhookPayload {
   kind: "crp.payment.fulfilled";
   payment: CrpPaymentRecord;

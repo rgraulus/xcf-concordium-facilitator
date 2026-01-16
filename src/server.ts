@@ -1,19 +1,18 @@
 // src/server.ts
 //
 // Fastify server wiring for XCF Concordium Facilitator.
-// - Wires health routes
-// - Wires /readyz operational readiness route
-// - Wires /metrics JSON metrics endpoint
-// - Wires CRP core routes (/v1/crp/*)
-// - Wires PLT search route (/v1/crp/plt/search)
-// - Wires PLT events route (/v1/crp/plt/events)
-// - Wires CRP payments routes (/v1/crp/payments/*)
+
+import "dotenv/config";
 
 import fastify, { FastifyInstance } from "fastify";
 
 // Health + base CRP routes (consensus, account, etc.)
 import healthRoute from "./routes/health";
-import crpRoutes from "./routes/crp";
+import crpReadsRoute from "./routes/crp.reads";
+
+// JWKS + Verify (JWS)
+import jwksRoute from "./routes/jwks";
+import { routes as verifyRoute } from "./routes/verify";
 
 // PLT search over crp_plt_events (backed by Postgres)
 import crpPltRoute from "./routes/crp.plt";
@@ -30,10 +29,15 @@ import metricsRoute from "./http/metrics";
 // CRP payments routes (/v1/crp/payments/*)
 import crpPaymentsRoute from "./routes/crp.payments";
 
+// Challenges route (/v1/challenges/*)
+import { routes as challengesRoute } from "./routes/challenges";
+
+
+// GET alias for exact match: /v1/crp/payments/exact-match
+import crpExactMatchAliasRoute from "./http/crpExactMatchAlias";
+
 export function buildServer(): FastifyInstance {
-  const app = fastify({
-    logger: true,
-  });
+  const app = fastify({ logger: true });
 
   // Operational readiness first, so orchestrators can probe quickly.
   app.register(readyzRoute);
@@ -41,11 +45,19 @@ export function buildServer(): FastifyInstance {
   // Basic health checks
   app.register(healthRoute);
 
+  // JWKS + Verify (no prefix unless your route file expects one)
+  app.register(jwksRoute);
+  app.register(verifyRoute);
+
   // Metrics endpoint (debug/ops)
   app.register(metricsRoute);
 
+  // Challenges (create + status)
+  app.register(challengesRoute);
+
+
   // Core CRP routes (consensus, accounts, etc.)
-  app.register(crpRoutes);
+  app.register(crpReadsRoute, { prefix: "/v1/crp" });
 
   // PLT search route: /v1/crp/plt/search
   app.register(crpPltRoute);
@@ -54,8 +66,10 @@ export function buildServer(): FastifyInstance {
   app.register(pltEventsRoute);
 
   // CRP payments routes under /v1/crp/payments/*
-  // The plugin itself mounts under /payments, so we prefix it with /v1/crp.
   app.register(crpPaymentsRoute, { prefix: "/v1/crp" });
+
+  // GET alias route under /v1/crp/payments/exact-match
+  app.register(crpExactMatchAliasRoute, { prefix: "/v1/crp" });
 
   return app;
 }
@@ -69,9 +83,7 @@ if (require.main === module) {
 
   app
     .listen({ port, host })
-    .then(() => {
-      app.log.info({ port, host }, "Server listening");
-    })
+    .then(() => app.log.info({ port, host }, "Server listening"))
     .catch((err) => {
       app.log.error({ err }, "Failed to start server");
       process.exit(1);

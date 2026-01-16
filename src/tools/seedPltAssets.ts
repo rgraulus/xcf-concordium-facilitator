@@ -2,19 +2,9 @@
 //
 // M3.4 – Seed PLT asset registry (crp_plt_assets)
 //
-// Purpose:
-//   - Insert (or update) a single row for the EUDemo PLT on testnet
-//   - Idempotent via ON CONFLICT (asset_id) DO UPDATE
+// This is safe to run multiple times (upsert).
 //
-// This does NOT touch crp_plt_events and is safe to run multiple times.
-//
-// Usage (direct):
-//   npx ts-node src/tools/seedPltAssets.ts
-//
-// Connection priority:
-//   1) CRP_DB_CONN_STRING
-//   2) DATABASE_URL
-//   3) Fallback to local xcf-pg / transaction-outcome
+// Default seed inserts EUDemo on concordium:testnet with decimals=6.
 
 import { Client } from "pg";
 
@@ -22,42 +12,62 @@ function getConnectionString(): string {
   const conn =
     process.env.CRP_DB_CONN_STRING ??
     process.env.DATABASE_URL ??
+    // Fallback for local xcf-pg (shared with transaction-logger)
     "postgres://postgres:pg@127.0.0.1:5432/transaction-outcome";
   return conn;
 }
+function parseIntEnv(name: string, defaultValue: number): number {
+  const raw = process.env[name];
+  if (!raw || raw.trim() === "") return defaultValue;
+  const v = Number.parseInt(raw, 10);
+  return Number.isFinite(v) ? v : defaultValue;
+}
 
-async function main(): Promise<void> {
-  const connectionString = getConnectionString();
-  const client = new Client({ connectionString });
+function log(msg: any): void {
+  // eslint-disable-next-line no-console
+  console.log("[PLT-SEED]", msg);
+}
 
-  // Hard-coded EUDemo PLT asset for testnet.
-  // Decimals: 6 (per Concordium testnet explorers)
-  // asset_id scheme matches the M3.4 Kick-off Pack.
-  const assetId = "concordium:testnet:PLT:EUDemo";
+export async function seedPltAssets(): Promise<void> {
+  // Default seed: EUDemo PLT asset on Concordium testnet.
+  // Decimals: 6.
+  // M4.2 schema: asset_id is the plain tokenId (e.g. "EUDemo"), scoped by (network, network_genesis_index).
+  const network = process.env.CRP_SEED_NETWORK ?? "concordium:testnet";
+  const networkGenesisIndex = parseIntEnv("CRP_SEED_NETWORK_GENESIS_INDEX", 6);
+  const assetId = process.env.CRP_SEED_ASSET_ID ?? "EUDemo";
+
   const symbol = "EUDemo";
   const decimals = 6;
-  const description = "EUDemo testnet PLT (CIS-7 protocol-level token)";
+  const description = "Concordium PLT demo token on testnet";
   const enabled = true;
 
-  console.log(
-    JSON.stringify({
-      source: "seed-plt-assets",
-      step: "connecting",
-      connectionStringRedacted: true,
-      assetId,
-      symbol,
-      decimals,
-      enabled,
-    })
-  );
-
-  await client.connect();
+  const client = new Client({ connectionString: getConnectionString() });
 
   try {
-    await client.query("BEGIN;");
+    await client.connect();
+
+  // Ensure registry table exists (safe no-op if already created).
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS crp_plt_assets (
+      network               TEXT    NOT NULL,
+      network_genesis_index INTEGER NOT NULL,
+      asset_id              TEXT    NOT NULL,
+      symbol                TEXT    NOT NULL,
+      decimals              INTEGER NOT NULL,
+      description           TEXT,
+      enabled               BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (network, network_genesis_index, asset_id)
+    );
+  `);
+
+    log(JSON.stringify({ step: "begin", assetId, symbol, decimals }));
 
     const upsertSql = `
       INSERT INTO crp_plt_assets (
+        network,
+        network_genesis_index,
         asset_id,
         symbol,
         decimals,
@@ -66,8 +76,9 @@ async function main(): Promise<void> {
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, now(), now())
-      ON CONFLICT (asset_id) DO UPDATE SET
+      VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
+      ON CONFLICT (network, network_genesis_index, asset_id) DO UPDATE
+      SET
         symbol = EXCLUDED.symbol,
         decimals = EXCLUDED.decimals,
         description = EXCLUDED.description,
@@ -75,46 +86,25 @@ async function main(): Promise<void> {
         updated_at = now();
     `;
 
-    const params = [assetId, symbol, decimals, description, enabled];
+    const params = [network, networkGenesisIndex, assetId, symbol, decimals, description, enabled];
+    await client.query(upsertSql, params);
 
-    const res = await client.query(upsertSql, params);
-
-    console.log(
-      JSON.stringify({
-        source: "seed-plt-assets",
-        step: "upsert-done",
-        rowCount: res.rowCount,
-      })
-    );
-
-    await client.query("COMMIT;");
-
-    console.log(
-      JSON.stringify({
-        source: "seed-plt-assets",
-        step: "commit",
-        assetId,
-        symbol,
-        decimals,
-        enabled,
-      })
-    );
-  } catch (err) {
-    console.error("[seed-plt-assets] failed:", err);
-    try {
-      await client.query("ROLLBACK;");
-    } catch {
-      // ignore rollback failure
-    }
-    process.exitCode = 1;
+    log(JSON.stringify({ step: "done", assetId }));
   } finally {
     await client.end();
   }
 }
 
+// Run directly: ts-node src/tools/seedPltAssets.ts
 if (require.main === module) {
-  main().catch((err) => {
-    console.error("[seed-plt-assets] crashed:", err);
-    process.exitCode = 1;
-  });
+  seedPltAssets()
+    .then(() => {
+      // eslint-disable-next-line no-console
+      console.log("[PLT-SEED] done");
+    })
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error("[PLT-SEED] failed:", err);
+      process.exitCode = 1;
+    });
 }

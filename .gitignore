@@ -24,3 +24,7 @@ ed25519.pem
 # local private keys / wallet exports (never commit)
 keys/
 NUL
+
+# Local backups / scratch
+.env.backup.*
+ipdata-*.txt

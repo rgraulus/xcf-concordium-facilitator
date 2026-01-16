@@ -3,14 +3,20 @@
 import { FastifyPluginAsync } from "fastify";
 
 /**
- * Simple health route for Kubernetes / container liveness checks.
+ * Simple health routes for liveness checks + CRP compatibility.
+ *
  * Exposes:
- *   GET /healthz -> { ok: true }
+ *   GET /healthz       -> { ok: true }
+ *   GET /v1/crp/health -> { ok: true }   (alias for older clients/docs)
  */
 const healthRoute: FastifyPluginAsync = async (fastify) => {
-  fastify.get("/healthz", async () => {
-    return { ok: true };
-  });
+  const handler = async () => ({ ok: true });
+
+  // Kubernetes / container liveness
+  fastify.get("/healthz", handler);
+
+  // CRP versioned alias
+  fastify.get("/v1/crp/health", handler);
 };
 
 export default healthRoute;

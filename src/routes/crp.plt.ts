@@ -1,205 +1,183 @@
-import { FastifyPluginAsync } from "fastify";
-import { Pool } from "pg";
+// src/routes/crp.plt.ts
+//
+// Fastify plugin for:
+//   GET /v1/crp/plt/search
+//
+// Queries persisted PLT transfers in Postgres (crp_plt_events).
+// Joins against crp_plt_assets to return decimals (and registry gating).
 
-const DATABASE_URL =
-  process.env.DATABASE_URL ??
-  process.env.CRP_DB_CONN_STRING ??
-  "postgres://postgres:pg@127.0.0.1:5432/transaction-outcome";
-
-const pool = new Pool({ connectionString: DATABASE_URL });
+import type { FastifyInstance } from "fastify";
+import { pool } from "../db/pool";
 
 export interface PltTransfer {
   block_hash: string;
   block_height: number;
-  network: string;
 
-  token_id: string; // maps to asset_id
+  network: string;
+  network_genesis_index: number;
+
+  token_id: string; // tokenId (asset_id)
+
   from_addr: string | null;
   to_addr: string | null;
 
-  amount_minor: string; // maps to amount_raw::text (atomic units)
+  amount_minor: string; // integer minor units
   decimals: number;
 
-  occurred_at: string; // ISO 8601
-  tx_hash: string; // maps to transaction_hash
+  tx_hash: string;
   event_index: number;
+
+  occurred_at: string; // ISO
 }
 
-interface CrpPltSearchQuery {
-  network?: string;
-  tokenId?: string; // asset_id
-  txHash?: string;  // transaction_hash
-  fromAddr?: string;
-  toAddr?: string;
-  minHeight?: string;
-  maxHeight?: string;
-  limit?: string;
+function rowToPltTransfer(r: any): PltTransfer {
+  return {
+    block_hash: String(r.block_hash),
+    block_height: Number(r.block_height),
+
+    network: String(r.network),
+    network_genesis_index: Number(r.network_genesis_index),
+
+    token_id: String(r.token_id),
+
+    from_addr: r.from_addr ? String(r.from_addr) : null,
+    to_addr: r.to_addr ? String(r.to_addr) : null,
+
+    amount_minor: String(r.amount_minor),
+    decimals: Number(r.decimals),
+
+    tx_hash: String(r.tx_hash),
+    event_index: Number(r.event_index),
+
+    occurred_at: new Date(r.occurred_at).toISOString(),
+  };
 }
 
-interface CrpPltSearchRoute {
-  Querystring: CrpPltSearchQuery;
+function parseBoolLoose(v: any): boolean | undefined {
+  if (v === undefined || v === null) return undefined;
+  const s = String(v).trim().toLowerCase();
+  if (s === "1" || s === "true" || s === "yes" || s === "y") return true;
+  if (s === "0" || s === "false" || s === "no" || s === "n") return false;
+  return undefined;
 }
 
-const crpPltRoute: FastifyPluginAsync = async (fastify) => {
-  fastify.get<CrpPltSearchRoute>(
-    "/v1/crp/plt/search",
-    {
-      schema: {
-        querystring: {
-          type: "object",
-          properties: {
-            network: { type: "string" },
-            tokenId: { type: "string" },
-            txHash: { type: "string" },
-            fromAddr: { type: "string" },
-            toAddr: { type: "string" },
-            minHeight: { type: "string" },
-            maxHeight: { type: "string" },
-            limit: { type: "string" },
-          },
-          additionalProperties: false,
-        },
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              events: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    block_hash: { type: "string" },
-                    block_height: { type: "number" },
-                    network: { type: "string" },
-                    token_id: { type: "string" },
-                    from_addr: { type: ["string", "null"] },
-                    to_addr: { type: ["string", "null"] },
-                    amount_minor: { type: "string" },
-                    decimals: { type: "number" },
-                    occurred_at: { type: "string" },
-                    tx_hash: { type: "string" },
-                    event_index: { type: "number" },
-                  },
-                  required: [
-                    "block_hash",
-                    "block_height",
-                    "network",
-                    "token_id",
-                    "amount_minor",
-                    "decimals",
-                    "occurred_at",
-                    "tx_hash",
-                    "event_index",
-                  ],
-                },
-              },
-            },
-            required: ["ok", "events"],
-          },
+export async function registerCrpPltRoutes(app: FastifyInstance): Promise<void> {
+  app.get("/v1/crp/plt/search", {
+    schema: {
+      querystring: {
+        type: "object",
+        properties: {
+          network: { type: "string" },
+          networkGenesisIndex: { type: "number" },
+          tokenId: { type: "string" },
+          to: { type: "string" },
+          amountMinor: { type: "string" },
+          includeDisabled: { type: "boolean" },
+          limit: { type: "number" },
         },
       },
     },
-    async (request) => {
-      const q = request.query;
+    handler: async (req, reply) => {
+      const q = (req.query ?? {}) as any;
+
+      const network = q.network ? String(q.network) : undefined;
+      const networkGenesisIndex =
+        typeof q.networkGenesisIndex === "number" && Number.isFinite(q.networkGenesisIndex)
+          ? Math.floor(q.networkGenesisIndex)
+          : undefined;
+
+      const tokenId = q.tokenId ? String(q.tokenId) : undefined;
+      const to = q.to ? String(q.to) : undefined;
+      const amountMinor = q.amountMinor ? String(q.amountMinor) : undefined;
+
+      const includeDisabled =
+        typeof q.includeDisabled === "boolean"
+          ? q.includeDisabled
+          : parseBoolLoose(q.includeDisabled) ?? false;
+
+      const limit =
+        typeof q.limit === "number" && Number.isFinite(q.limit)
+          ? Math.max(1, Math.min(100, Math.floor(q.limit)))
+          : 50;
 
       const params: any[] = [];
-      const where: string[] = [];
+      let where = "WHERE 1=1";
 
-      if (q.network) {
-        params.push(q.network);
-        where.push(`e.network = $${params.length}`);
+      if (network) {
+        params.push(network);
+        where += ` AND e.network = $${params.length}`;
       }
 
-      if (q.tokenId) {
-        params.push(q.tokenId);
-        where.push(`e.asset_id = $${params.length}`);
+      if (typeof networkGenesisIndex === "number") {
+        params.push(networkGenesisIndex);
+        where += ` AND e.network_genesis_index = $${params.length}`;
       }
 
-      if (q.txHash) {
-        params.push(q.txHash);
-        where.push(`e.transaction_hash = $${params.length}`);
+      if (tokenId) {
+        params.push(tokenId);
+        where += ` AND e.asset_id = $${params.length}`;
       }
 
-      if (q.fromAddr) {
-        params.push(q.fromAddr);
-        where.push(`e.from_address = $${params.length}`);
+      if (to) {
+        params.push(to);
+        where += ` AND e.to_address = $${params.length}`;
       }
 
-      if (q.toAddr) {
-        params.push(q.toAddr);
-        where.push(`e.to_address = $${params.length}`);
+      if (amountMinor) {
+        params.push(amountMinor);
+        where += ` AND e.amount_raw::text = $${params.length}`;
       }
 
-      const minHeight =
-        q.minHeight && q.minHeight.trim() !== "" ? Number(q.minHeight) : undefined;
-      const maxHeight =
-        q.maxHeight && q.maxHeight.trim() !== "" ? Number(q.maxHeight) : undefined;
-
-      if (!Number.isNaN(minHeight) && minHeight !== undefined) {
-        params.push(minHeight);
-        where.push(`e.block_height >= $${params.length}`);
+      // Default: only enabled assets unless explicitly overridden.
+      if (!includeDisabled) {
+        where += ` AND a.enabled = true`;
       }
 
-      if (!Number.isNaN(maxHeight) && maxHeight !== undefined) {
-        params.push(maxHeight);
-        where.push(`e.block_height <= $${params.length}`);
-      }
-
-      const rawLimit =
-        q.limit && q.limit.trim() !== "" ? Number(q.limit) : undefined;
-      const limit = !rawLimit || Number.isNaN(rawLimit) ? 50 : rawLimit;
-      const cappedLimit = Math.min(limit, 500);
-
-      params.push(cappedLimit);
+      params.push(limit);
+      const limitIdx = params.length;
 
       const sql = `
         SELECT
           e.block_hash,
           e.block_height,
           e.network,
+          e.network_genesis_index,
+
           e.asset_id AS token_id,
           e.from_address AS from_addr,
           e.to_address AS to_addr,
           e.amount_raw::text AS amount_minor,
           a.decimals AS decimals,
-          e.occurred_at,
+
           e.transaction_hash AS tx_hash,
-          e.event_index
-        FROM crp_plt_events e
-        JOIN crp_plt_assets a
+          e.event_index AS event_index,
+
+          e.occurred_at
+        FROM public.crp_plt_events e
+        JOIN public.crp_plt_assets a
           ON a.asset_id = e.asset_id
-        ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-        ORDER BY e.block_height DESC, e.event_index ASC
-        LIMIT $${params.length}
+         AND a.network = e.network
+         AND a.network_genesis_index = e.network_genesis_index
+        ${where}
+        ORDER BY e.occurred_at DESC
+        LIMIT $${limitIdx}
       `;
 
-      const { rows } = await pool.query(sql, params);
+      const res = await pool.query(sql, params);
+      const events = res.rows.map(rowToPltTransfer);
 
-      const events: PltTransfer[] = rows.map((r) => {
-        const occurred =
-          r.occurred_at instanceof Date
-            ? r.occurred_at.toISOString()
-            : String(r.occurred_at);
-
-        return {
-          block_hash: r.block_hash,
-          block_height: Number(r.block_height),
-          network: r.network,
-          token_id: r.token_id,
-          from_addr: r.from_addr,
-          to_addr: r.to_addr,
-          amount_minor: String(r.amount_minor),
-          decimals: Number(r.decimals),
-          occurred_at: occurred,
-          tx_hash: r.tx_hash,
-          event_index: Number(r.event_index),
-        };
+      // Keep backward compatibility: return "events".
+      // (Optionally also expose "transfers" as an alias.)
+      return reply.send({
+        ok: true,
+        events,
+        transfers: events,
       });
+    },
+  });
+}
 
-      return { ok: true, events };
-    }
-  );
-};
-
-export default crpPltRoute;
+// Default export as a Fastify plugin (what src/server.ts expects).
+export default async function crpPltPlugin(app: FastifyInstance): Promise<void> {
+  await registerCrpPltRoutes(app);
+}

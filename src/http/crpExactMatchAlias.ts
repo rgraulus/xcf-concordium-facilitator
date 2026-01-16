@@ -1,12 +1,12 @@
 // src/http/crpExactMatchAlias.ts
 //
 // Thin GET alias for the existing exact-tuple match logic in
-// POST /v1/crp/payments/match.
+// POST /v1/crp/payments/match, with optional event-proof gating.
 //
-// Route (with /v1/crp prefix from server.ts):
+// Mounted with /v1/crp prefix from server.ts:
 //   GET /v1/crp/payments/exact-match
 //
-// Query parameters (we accept BOTH camelCase and snake_case):
+// Query parameters (accept BOTH camelCase and snake_case):
 //
 //   merchantId | merchant_id   (required)
 //   nonce                      (required)
@@ -14,35 +14,32 @@
 //   tokenId   | token_id       (required)
 //   amount                     (required, e.g. "25.00")
 //   payTo     | pay_to         (required)
-//   decimals                   (optional; defaults to 2)
+//   decimals                   (optional; if omitted, resolve from crp_plt_assets)
 //   assetType                  (optional; defaults to "PLT")
+//   requireEvent               (optional; default TRUE; if truthy, require matching crp_plt_events row)
 //
-// Response shape mirrors POST /v1/crp/payments/match:
-//
-//   200 OK
-//   - on success:
-//       { ok: true, reason: "exact_match", count: 1, match: {...} }
-//   - on no match:
-//       { ok: false, reason: "no_match", count: 0 }
-//   - on bad request:
-//       400 + { ok: false, reason: "bad_request", error: "..." }
+// Response mirrors POST /v1/crp/payments/match, with extra `resolved` when helpful.
 
 import type { FastifyPluginCallback } from "fastify";
-import {
-  searchPayments,
-  type PaymentSearchFilters,
-} from "../store/match.pg";
+import { pool } from "../db/pool";
+import { toMinorUnits } from "../crp/decimals-registry";
+import { searchPayments, type PaymentSearchFilters } from "../store/match.pg";
 
 // Narrow helper: best-effort string extraction.
 function asTrimmedString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-// Helper: parse decimals (NaN if useless).
+// Helper: parse number (NaN if useless).
 function asNumberOrNaN(value: unknown): number {
   if (value === undefined || value === null) return NaN;
   const n = Number(value);
   return Number.isFinite(n) ? n : NaN;
+}
+
+function asBooleanish(value: unknown): boolean {
+  const s = asTrimmedString(value).toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "y" || s === "on";
 }
 
 // Our internal representation of the tuple we want to match.
@@ -55,6 +52,105 @@ interface ExactMatchInput {
   payTo: string;
   assetType: string;
   decimals: number;
+  requireEvent: boolean;
+}
+
+type ResolvedInfo = {
+  decimals: number;
+  networkGenesisIndex: number;
+  decimalsSource: "query(decimals)" | "db(crp_plt_assets)" | "default(2)";
+};
+
+async function resolveDecimalsAndGenesisIndex(
+  network: string,
+  tokenId: string,
+  decimalsFromQuery: number | null
+): Promise<ResolvedInfo> {
+  // If caller provided decimals explicitly, we still try to resolve genesis index from DB
+  // (best-effort), but we won't override decimals.
+  if (decimalsFromQuery !== null && Number.isFinite(decimalsFromQuery)) {
+    let ng = 0;
+    try {
+      const r = await pool.query(
+        `
+        SELECT network_genesis_index
+        FROM public.crp_plt_assets
+        WHERE network = $1
+          AND asset_id = $2
+        ORDER BY network_genesis_index DESC
+        LIMIT 1
+        `,
+        [network, tokenId]
+      );
+      if ((r.rowCount ?? 0) > 0) {
+        ng = Number(r.rows[0].network_genesis_index);
+      }
+    } catch {
+      // ignore: genesis index remains 0
+    }
+
+    return {
+      decimals: Number(decimalsFromQuery),
+      networkGenesisIndex: Number.isFinite(ng) ? ng : 0,
+      decimalsSource: "query(decimals)",
+    };
+  }
+
+  // Otherwise, resolve from DB registry.
+  const res = await pool.query(
+    `
+    SELECT decimals, network_genesis_index
+    FROM public.crp_plt_assets
+    WHERE network = $1
+      AND asset_id = $2
+      AND enabled = TRUE
+    ORDER BY network_genesis_index DESC
+    LIMIT 1
+    `,
+    [network, tokenId]
+  );
+
+  if ((res.rowCount ?? 0) > 0) {
+    const row = res.rows[0];
+    return {
+      decimals: Number(row.decimals),
+      networkGenesisIndex: Number(row.network_genesis_index),
+      decimalsSource: "db(crp_plt_assets)",
+    };
+  }
+
+  // Final fallback (keeps old behavior for demo tokens that aren't seeded).
+  return {
+    decimals: 2,
+    networkGenesisIndex: 0,
+    decimalsSource: "default(2)",
+  };
+}
+
+async function hasMatchingPltEvent(args: {
+  network: string;
+  networkGenesisIndex: number;
+  tokenId: string;
+  payTo: string;
+  amountMinor: string;
+}): Promise<boolean> {
+  const { network, networkGenesisIndex, tokenId, payTo, amountMinor } = args;
+
+  const res = await pool.query(
+    `
+    SELECT 1
+    FROM public.crp_plt_events
+    WHERE network = $1
+      AND network_genesis_index = $2
+      AND asset_id = $3
+      AND to_address = $4
+      AND amount_raw::text = $5
+    LIMIT 1
+    `,
+    [network, networkGenesisIndex, tokenId, payTo, amountMinor]
+  );
+
+  return (res.rowCount ?? 0) > 0;
 }
 
 const crpExactMatchAliasPlugin: FastifyPluginCallback = async (server) => {
@@ -77,14 +173,31 @@ const crpExactMatchAliasPlugin: FastifyPluginCallback = async (server) => {
       asTrimmedString(q.payTo) || asTrimmedString(q.pay_to);
 
     const decimalsRaw = q.decimals;
-    const assetTypeRaw = q.assetType;
+    const assetTypeRaw = q.assetType ?? q.asset_type;
 
-    const decimals = !Number.isNaN(asNumberOrNaN(decimalsRaw))
-      ? asNumberOrNaN(decimalsRaw)
-      : 2; // sensible default for demo tokens like usd:test
+    // Default requireEvent = TRUE unless explicitly provided as 0/false.
+    const requireEventRaw = q.requireEvent ?? q.require_event;
+    const requireEvent =
+      requireEventRaw === undefined ? true : asBooleanish(requireEventRaw);
 
-    const assetType =
-      asTrimmedString(assetTypeRaw) || "PLT";
+    const decimalsFromQuery =
+      !Number.isNaN(asNumberOrNaN(decimalsRaw)) ? asNumberOrNaN(decimalsRaw) : null;
+
+    const assetType = asTrimmedString(assetTypeRaw) || "PLT";
+
+    // Basic validation – same spirit as POST /payments/match.
+    if (!merchantId || !nonce || !network || !tokenId || !amount || !payTo) {
+      reply.code(400);
+      return {
+        ok: false,
+        reason: "bad_request",
+        error:
+          "Missing required query parameters. Required: merchantId, nonce, network, tokenId, amount, payTo. Optional: decimals, assetType, requireEvent.",
+      };
+    }
+
+    // Resolve decimals + genesis index (DB-first when decimals omitted).
+    const resolved = await resolveDecimalsAndGenesisIndex(network, tokenId, decimalsFromQuery);
 
     const input: ExactMatchInput = {
       merchantId,
@@ -94,36 +207,16 @@ const crpExactMatchAliasPlugin: FastifyPluginCallback = async (server) => {
       amount,
       payTo,
       assetType,
-      decimals,
+      decimals: resolved.decimals,
+      requireEvent,
     };
 
-    // Basic validation – same spirit as POST /payments/match.
-    if (
-      !input.merchantId ||
-      !input.nonce ||
-      !input.network ||
-      !input.tokenId ||
-      !input.amount ||
-      !input.payTo ||
-      Number.isNaN(input.decimals)
-    ) {
-      reply.code(400);
-      return {
-        ok: false,
-        reason: "bad_request",
-        error:
-          "Missing or invalid required query parameters. Required: merchantId, nonce, network, tokenId, amount, payTo. Optional: decimals, assetType.",
-      };
-    }
-
-    // Use the same "first narrow by tuple, then in-memory exact match" pattern
-    // as the existing findExactMatch() in src/routes/crp.payments.ts.
+    // Search by the “narrow” tuple first (same pattern as crp.payments.ts).
     const filters: PaymentSearchFilters = {
       merchantId: input.merchantId,
       network: input.network,
       tokenId: input.tokenId,
       payTo: input.payTo,
-      // 100 is plenty for dev/demo and keeps the query bounded.
       limit: 100,
     };
 
@@ -147,7 +240,49 @@ const crpExactMatchAliasPlugin: FastifyPluginCallback = async (server) => {
         ok: false,
         reason: "no_match",
         count: 0,
+        resolved,
       };
+    }
+
+    // Optional event-proof gating (default ON).
+    if (input.requireEvent) {
+      let amountMinor: string;
+      try {
+        amountMinor = toMinorUnits(input.amount, input.decimals);
+      } catch (err: any) {
+        reply.code(400);
+        return {
+          ok: false,
+          reason: "bad_request",
+          error: String(err?.message ?? err ?? "Invalid amount/decimals"),
+          resolved,
+        };
+      }
+
+      const found = await hasMatchingPltEvent({
+        network: input.network,
+        networkGenesisIndex: resolved.networkGenesisIndex,
+        tokenId: input.tokenId,
+        payTo: input.payTo,
+        amountMinor,
+      });
+
+      if (!found) {
+        return {
+          ok: false,
+          reason: "no_event",
+          count: 0,
+          match, // tuple match exists, but event proof missing
+          required: {
+            network: input.network,
+            networkGenesisIndex: resolved.networkGenesisIndex,
+            tokenId: input.tokenId,
+            to: input.payTo,
+            amountMinor,
+          },
+          resolved,
+        };
+      }
     }
 
     return {
@@ -155,6 +290,7 @@ const crpExactMatchAliasPlugin: FastifyPluginCallback = async (server) => {
       reason: "exact_match",
       count: 1,
       match,
+      resolved,
     };
   });
 };
