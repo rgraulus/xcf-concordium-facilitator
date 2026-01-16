@@ -11,7 +11,7 @@ import {
 
 /**
  * Shape of an error response from wallet-proxy.
- * See "Errors" section in the wallet-proxy README. :contentReference[oaicite:0]{index=0}
+ * See "Errors" section in the wallet-proxy README.
  */
 export interface WalletProxyErrorResponse {
   error: number;
@@ -19,35 +19,48 @@ export interface WalletProxyErrorResponse {
 }
 
 /**
- * High-level shape of a single transaction entry from /v3/accTransactions.
- * This is intentionally partial; we only model fields we are likely to consume
- * in the PLT extractor phase, and keep the rest as "unknown".
- *
- * See "Get transactions" section in wallet-proxy README. 
+ * High-level shape of a single transaction entry from /v3/accTransactions/{account}.
+ * Intentionally partial.
  */
 export interface WalletProxyTransaction {
   id: number;
   blockTime: number;
+
   transactionHash?: string;
   blockHash?: string;
+  blockHeight?: number;
+
   total?: number;
   energy?: number;
+
   origin?: {
     type: string;
-    // other fields omitted for now
     [key: string]: unknown;
   };
+
   details?: {
     type?: string;
     outcome?: string;
+
+    // CCD transfer
     transferAmount?: string;
     transferSource?: string;
     transferDestination?: string;
+
+    // Token update (PLT)
+    tokenId?: string;
+    tokenTransferAmount?: {
+      decimals?: number;
+      value?: string;
+      [key: string]: unknown;
+    };
+
+    memo?: string;
     events?: string[];
-    // v3 adds PLT-specific types like "updateCreatePLT" etc; we keep it open-ended. :contentReference[oaicite:2]{index=2}
+
     [key: string]: unknown;
   };
-  // allow unknown extra fields for future expansion
+
   [key: string]: unknown;
 }
 
@@ -64,7 +77,6 @@ export interface WalletProxyAccTransactionsResponse {
 
 /**
  * Parameters we care about for /v3/accTransactions.
- * (The endpoint supports more flags; we can extend this type later. :contentReference[oaicite:3]{index=3})
  */
 export interface GetAccountTransactionsParams {
   limit?: number;
@@ -72,14 +84,11 @@ export interface GetAccountTransactionsParams {
   from?: number | string;
   blockTimeFrom?: number;
   blockTimeTo?: number;
-  includeRewards?:
-    | "none"
-    | "allButFinalization"
-    | "all"; // matches wallet-proxy README
+  includeRewards?: "none" | "allButFinalization" | "all";
 }
 
 /**
- * Error thrown when a wallet-proxy HTTP call fails (network, 5xx, or error JSON).
+ * Error thrown when a wallet-proxy HTTP call fails.
  */
 export class WalletProxyRequestError extends Error {
   public readonly statusCode?: number;
@@ -92,30 +101,30 @@ export class WalletProxyRequestError extends Error {
     this.responseBody = responseBody;
   }
 
-  /**
-   * Returns true if this error looks transient (e.g., node overload / timeout)
-   * and a retry might succeed.
-   */
   public isTransient(): boolean {
-    // 5xx HTTP codes are generally transient.
+    // 5xx are generally transient
+    if (typeof this.statusCode === "number" && this.statusCode >= 500 && this.statusCode <= 599) {
+      return true;
+    }
+
+    // Connection/refusal/timeouts are transient
+    const msg = (this.message || "").toLowerCase();
     if (
-      typeof this.statusCode === "number" &&
-      this.statusCode >= 500 &&
-      this.statusCode <= 599
+      msg.includes("econnrefused") ||
+      msg.includes("econnreset") ||
+      msg.includes("etimedout") ||
+      msg.includes("timeout") ||
+      msg.includes("timed out") ||
+      msg.includes("socket hang up") ||
+      msg.includes("enotfound")
     ) {
       return true;
     }
 
     const body = this.responseBody as Partial<WalletProxyErrorResponse> | undefined;
-    if (body && typeof body.error === "number" && typeof body.errorMessage === "string") {
-      // Wallet-proxy uses error codes + messages; "node overloaded / timeout"
-      // cases are transient from our perspective.
+    if (body && typeof body.errorMessage === "string") {
       const lower = body.errorMessage.toLowerCase();
-      if (
-        lower.includes("overloaded") ||
-        lower.includes("timeout") ||
-        lower.includes("timed out")
-      ) {
+      if (lower.includes("overloaded") || lower.includes("timeout") || lower.includes("timed out")) {
         return true;
       }
     }
@@ -125,14 +134,7 @@ export class WalletProxyRequestError extends Error {
 }
 
 /**
- * Public entrypoint: fetch transactions affecting an account's CCD/PLT balances
- * via wallet-proxy's /v3/accTransactions/{account} endpoint. 
- *
- * This function:
- * - reads config from env (WALLET_PROXY_BASE_URL, etc.)
- * - constructs the v3 URL with the specified parameters
- * - performs a GET with timeout and simple retries
- * - throws WalletProxyRequestError on failure
+ * Public entrypoint: fetch transactions affecting an account via /v3/accTransactions/{account}.
  */
 export async function getAccountTransactions(
   account: string,
@@ -147,7 +149,6 @@ export async function getAccountTransactions(
     config = getWalletProxyConfigFromEnv();
   } catch (err) {
     if (err instanceof WalletProxyConfigError) {
-      // Re-wrap as request error so callers don't have to know about config internals.
       throw new WalletProxyRequestError(`Wallet-proxy config error: ${err.message}`);
     }
     throw err;
@@ -157,31 +158,44 @@ export async function getAccountTransactions(
   return requestWithRetry<WalletProxyAccTransactionsResponse>(config, url);
 }
 
+/**
+ * Helper: get the latest wallet-proxy tx id for an account (or 0 if none).
+ * Uses descending order, limit=1.
+ */
+export async function getLatestAccountTransactionId(account: string): Promise<number> {
+  const resp = await getAccountTransactions(account, {
+    limit: 1,
+    order: "descending",
+    includeRewards: "none",
+  });
+
+  const tx0 = Array.isArray(resp.transactions) && resp.transactions.length > 0 ? resp.transactions[0] : undefined;
+  const id = typeof tx0?.id === "number" && Number.isFinite(tx0.id) ? tx0.id : 0;
+  return id;
+}
+
 function buildAccTransactionsUrl(
   baseUrl: string,
   account: string,
   params: GetAccountTransactionsParams
 ): URL {
-  const url = new URL(
-    `/v3/accTransactions/${encodeURIComponent(account)}`,
-    baseUrl
-  );
+  const url = new URL(`/v3/accTransactions/${encodeURIComponent(account)}`, baseUrl);
 
-  if (typeof params.limit === "number") {
+  if (typeof params.limit === "number" && Number.isFinite(params.limit)) {
     url.searchParams.set("limit", String(params.limit));
   }
   if (params.order) {
-    // API uses a single-letter 'a'/'d' in query, but it returns a full word in the response. :contentReference[oaicite:5]{index=5}
+    // wallet-proxy uses 'a' / 'd' in query
     const value = params.order === "descending" ? "d" : "a";
     url.searchParams.set("order", value);
   }
   if (params.from !== undefined) {
     url.searchParams.set("from", String(params.from));
   }
-  if (typeof params.blockTimeFrom === "number") {
+  if (typeof params.blockTimeFrom === "number" && Number.isFinite(params.blockTimeFrom)) {
     url.searchParams.set("blockTimeFrom", String(params.blockTimeFrom));
   }
-  if (typeof params.blockTimeTo === "number") {
+  if (typeof params.blockTimeTo === "number" && Number.isFinite(params.blockTimeTo)) {
     url.searchParams.set("blockTimeTo", String(params.blockTimeTo));
   }
   if (params.includeRewards) {
@@ -191,22 +205,15 @@ function buildAccTransactionsUrl(
   return url;
 }
 
-/**
- * Perform a GET request with retries using Node's http/https modules.
- */
-async function requestWithRetry<T>(
-  config: WalletProxyConfig,
-  url: URL
-): Promise<T> {
+async function requestWithRetry<T>(config: WalletProxyConfig, url: URL): Promise<T> {
   const maxAttempts = Math.max(1, config.maxRetries + 1);
-  let lastError: unknown;
+  let lastError: unknown = undefined;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const { statusCode, body } = await httpGetJson(url, config.requestTimeoutMs);
 
       if (!statusCode || statusCode < 200 || statusCode >= 300) {
-        // Non-2xx: try to interpret as wallet-proxy error JSON.
         const errorBody = body as Partial<WalletProxyErrorResponse> | undefined;
         if (errorBody && typeof errorBody.errorMessage === "string") {
           throw new WalletProxyRequestError(
@@ -215,20 +222,11 @@ async function requestWithRetry<T>(
             body
           );
         }
-        throw new WalletProxyRequestError(
-          `Wallet-proxy returned HTTP ${statusCode}`,
-          statusCode,
-          body
-        );
+        throw new WalletProxyRequestError(`Wallet-proxy returned HTTP ${statusCode}`, statusCode, body);
       }
 
-      // 2xx; see if this is still an "error" wrapper according to wallet-proxy's spec.
       const maybeError = body as Partial<WalletProxyErrorResponse>;
-      if (
-        maybeError &&
-        typeof maybeError.error === "number" &&
-        typeof maybeError.errorMessage === "string"
-      ) {
+      if (maybeError && typeof maybeError.error === "number" && typeof maybeError.errorMessage === "string") {
         throw new WalletProxyRequestError(
           `Wallet-proxy error ${maybeError.error}: ${maybeError.errorMessage}`,
           statusCode,
@@ -241,11 +239,10 @@ async function requestWithRetry<T>(
       lastError = err;
 
       const wpErr = err as WalletProxyRequestError;
-      const isTransient =
-        wpErr instanceof WalletProxyRequestError ? wpErr.isTransient() : true;
+      const transient = wpErr instanceof WalletProxyRequestError ? wpErr.isTransient() : true;
 
-      const isLastAttempt = attempt === maxAttempts;
-      if (!isTransient || isLastAttempt) {
+      const isLast = attempt === maxAttempts;
+      if (!transient || isLast) {
         throw err;
       }
 
@@ -254,15 +251,10 @@ async function requestWithRetry<T>(
     }
   }
 
-  // We should never reach this because we either returned or threw,
-  // but TypeScript wants a return type.
   throw lastError ?? new WalletProxyRequestError("Unknown wallet-proxy error.");
 }
 
-function httpGetJson(
-  url: URL,
-  timeoutMs: number
-): Promise<{ statusCode?: number; body: unknown }> {
+function httpGetJson(url: URL, timeoutMs: number): Promise<{ statusCode?: number; body: unknown }> {
   return new Promise((resolve, reject) => {
     const lib = url.protocol === "https:" ? https : http;
 
@@ -272,12 +264,11 @@ function httpGetJson(
         hostname: url.hostname,
         port: url.port || (url.protocol === "https:" ? 443 : 80),
         path: url.pathname + url.search,
-        timeout: timeoutMs,
       },
       (res) => {
         let data = "";
-
         res.setEncoding("utf8");
+
         res.on("data", (chunk: string) => {
           data += chunk;
         });
@@ -287,16 +278,13 @@ function httpGetJson(
             resolve({ statusCode: res.statusCode ?? 0, body: null });
             return;
           }
-
           try {
             const parsed = JSON.parse(data);
             resolve({ statusCode: res.statusCode ?? 0, body: parsed });
           } catch (parseErr) {
             reject(
               new WalletProxyRequestError(
-                `Failed to parse wallet-proxy JSON response: ${
-                  (parseErr as Error).message
-                }`,
+                `Failed to parse wallet-proxy JSON response: ${(parseErr as Error).message}`,
                 res.statusCode ?? 0,
                 data
               )
@@ -306,20 +294,14 @@ function httpGetJson(
       }
     );
 
+    req.setTimeout(timeoutMs);
+
     req.on("error", (err) => {
-      reject(
-        new WalletProxyRequestError(
-          `Wallet-proxy request failed: ${(err as Error).message}`
-        )
-      );
+      reject(new WalletProxyRequestError(`Wallet-proxy request failed: ${(err as Error).message}`));
     });
 
     req.on("timeout", () => {
-      req.destroy(
-        new WalletProxyRequestError(
-          `Wallet-proxy request timed out after ${timeoutMs}ms.`
-        )
-      );
+      req.destroy(new WalletProxyRequestError(`Wallet-proxy request timed out after ${timeoutMs}ms.`));
     });
 
     req.end();
@@ -327,7 +309,7 @@ function httpGetJson(
 }
 
 function computeBackoffMs(attempt: number): number {
-  // Simple exponential backoff: 250ms, 500ms, 1000ms, ...
+  // 250ms, 500ms, 1000ms, 2000ms, ...
   const base = 250;
   const factor = Math.pow(2, attempt - 1);
   return base * factor;

@@ -75,6 +75,8 @@ export interface ConcordiumPltScanSummary {
 
   sampleEvents: Array<{
     transactionHash: string;
+    txId: number;
+    blockHash: string;
     blockHeight: number;
     assetId: string;
     amountRaw: string;
@@ -122,7 +124,7 @@ export class ConcordiumPltSource {
     // Forward progress cursor (wallet-proxy tx id)
     let bestHeight = lastHeightExclusive;
     for (const tx of txs) {
-      if (typeof tx?.id === "number" && tx.id > bestHeight) {
+      if (typeof tx?.id === "number" && Number.isFinite(tx.id) && tx.id > bestHeight) {
         bestHeight = tx.id;
       }
     }
@@ -132,25 +134,32 @@ export class ConcordiumPltSource {
 
     for (const tx of txs) {
       const details: any = tx?.details ?? {};
-      const detailsType = String(details?.type ?? "");
-      const detailsEvents: string[] = Array.isArray(details?.events)
-        ? details.events.map((e: any) => String(e))
-        : [];
 
-      // Heuristic for "PLT-ish" activity (still coarse)
-      const isPltTx =
-        detailsType === "updateCreatePLT" ||
-        detailsType === "tokenGovernance" ||
-        detailsType === "tokenHolder" ||
-        detailsEvents.some((e: string) => e.toLowerCase().includes("plt"));
+      // Structured token transfer extraction (wallet-proxy v3 style).
+      // Your real-time tx shows:
+      //   details.type = "tokenUpdate"
+      //   details.tokenId = "EUDemo"
+      //   details.tokenTransferAmount = { decimals: 6, value: "20000" }
+      const tokenId = typeof details?.tokenId === "string" ? details.tokenId : "";
 
-      if (!isPltTx) continue;
+      const tokenAmountValue =
+        details?.tokenTransferAmount && typeof details.tokenTransferAmount.value !== "undefined"
+          ? String(details.tokenTransferAmount.value)
+          : "";
+
+      const isTokenTransferForAsset =
+        tokenId === assetId && tokenAmountValue.trim() !== "";
+
+      if (!isTokenTransferForAsset) continue;
 
       const txId =
         typeof tx?.id === "number" && Number.isFinite(tx.id) ? tx.id : bestHeight;
 
       const blockHash = String(tx?.blockHash ?? "");
-      const blockHeight = Number(tx?.blockHeight ?? 0);
+      // wallet-proxy often does not return blockHeight for this endpoint; keep 0 if absent.
+      const blockHeight = Number.isFinite(Number(tx?.blockHeight))
+        ? Number(tx.blockHeight)
+        : 0;
 
       const transactionHash = String(tx?.transactionHash ?? `id:${txId}`);
       const eventIndex = 0;
@@ -167,8 +176,7 @@ export class ConcordiumPltSource {
           ? new Date(tx.blockTime * 1000)
           : new Date();
 
-      // TODO: replace with real PLT amount extraction once available
-      const amountRaw = "0";
+      const amountRaw = tokenAmountValue;
 
       const ev: ExtractedPltEvent = {
         network,
@@ -196,6 +204,8 @@ export class ConcordiumPltSource {
       if (sampleEvents.length < 3) {
         sampleEvents.push({
           transactionHash: ev.transactionHash,
+          txId,
+          blockHash: ev.blockHash,
           blockHeight: ev.blockHeight,
           assetId: ev.assetId,
           amountRaw: ev.amountRaw,
@@ -246,6 +256,7 @@ function normalizeAccountForWalletProxy(inputRaw: string): { normalized: string;
 export function createConcordiumNodeConfigFromEnv(): ConcordiumNodeConfig {
   const network = process.env.CRP_STREAM_NETWORK ?? "concordium:testnet";
 
+  // Asset id / token id for PLT
   const assetId =
     process.env.CONCORDIUM_PLT_TOKEN_ID ??
     process.env.CRP_STREAM_TOKEN_ID ??

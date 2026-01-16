@@ -1,7 +1,7 @@
 services:
   wallet-proxy:
     container_name: xcf-wallet-proxy
-    image: concordium/wallet-proxy:0.41.1-0
+    image: concordium/wallet-proxy:0.43.0-0
     restart: unless-stopped
     ports:
       - "3000:3000"
