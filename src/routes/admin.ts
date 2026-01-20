@@ -1,6 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { repo } from "../store";
 import { signJws } from "../crypto/signer";
+import { normalizeNetworkId } from "../lib/networkId";
 
 export async function routes(app: FastifyInstance) {
   app.post("/v1/admin/fulfill", async (req, reply) => {
@@ -21,8 +22,14 @@ export async function routes(app: FastifyInstance) {
       });
     }
 
-    const jws = signJws(receipt);
-    await repo.markFulfilled(merchant_id, nonce, receipt, jws);
+    // Best-effort canonicalize receipt.network if present
+    const r: Record<string, unknown> = { ...receipt };
+    if (typeof r.network === "string") {
+      r.network = normalizeNetworkId(r.network);
+    }
+
+    const jws = signJws(r);
+    await repo.markFulfilled(merchant_id, nonce, r, jws);
 
     return reply.code(200).send({ merchant_id, nonce, jws });
   });

@@ -41,6 +41,7 @@ import type {
 } from "../contracts/crpGateway";
 import { getPltAsset, getDefaultNetworkGenesisIndex } from "../store/pltAssets.pg";
 import { signJws } from "../crypto/signer";
+import { normalizeNetworkId, networkCandidates } from "../lib/networkId";
 
 // For clarity in this module:
 type PaymentMatchInput = CrpMatchRequest;
@@ -74,6 +75,7 @@ function currentKid(): string {
 }
 
 type PltEventRow = {
+  network: string;
   from_address: string | null;
   to_address: string | null;
   transaction_hash: string;
@@ -84,17 +86,18 @@ type PltEventRow = {
 };
 
 async function findMatchingPltEvent(args: {
-  network: string;
+  networkCandidates: string[];
   networkGenesisIndex: number;
   tokenId: string;
   payTo: string;
   amountMinor: string;
 }): Promise<PltEventRow | null> {
-  const { network, networkGenesisIndex, tokenId, payTo, amountMinor } = args;
+  const { networkCandidates: nets, networkGenesisIndex, tokenId, payTo, amountMinor } = args;
 
   const res = await pool.query(
     `
     SELECT
+      network,
       from_address,
       to_address,
       transaction_hash,
@@ -103,7 +106,7 @@ async function findMatchingPltEvent(args: {
       event_index,
       network_genesis_index
     FROM public.crp_plt_events
-    WHERE network = $1
+    WHERE network = ANY($1)
       AND network_genesis_index = $2
       AND asset_id = $3
       AND to_address = $4
@@ -111,13 +114,14 @@ async function findMatchingPltEvent(args: {
     ORDER BY occurred_at DESC
     LIMIT 1
     `,
-    [network, networkGenesisIndex, tokenId, payTo, amountMinor]
+    [nets, networkGenesisIndex, tokenId, payTo, amountMinor]
   );
 
   if ((res.rowCount ?? 0) === 0) return null;
 
   const r = res.rows[0];
   return {
+    network: String(r.network),
     from_address: r.from_address ? String(r.from_address) : null,
     to_address: r.to_address ? String(r.to_address) : null,
     transaction_hash: String(r.transaction_hash),
@@ -189,22 +193,29 @@ async function normalizeAssetWithRegistry(
 // Helper: perform an exact-tuple match by:
 // 1) Using searchPayments with a reasonably tight filter.
 // 2) Doing an in-memory exact comparison on the remaining fields.
+// NOTE: To bridge CAIP-2 <-> legacy network strings, we broaden search when needed.
 async function findExactMatch(input: PaymentMatchInput): Promise<CrpPaymentRecord | null> {
+  const netCands = networkCandidates(input.network);
+
   const filters: PaymentSearchFilters = {
     merchantId: input.merchantId,
-    network: input.network,
+    // If we have multiple candidates (CAIP-2 + legacy), don't over-constrain search
+    network: netCands.length === 1 ? netCands[0] : undefined,
     tokenId: input.asset.tokenId,
     payTo: input.payTo,
-    limit: 100,
+    limit: 250,
   };
 
   const rows = (await searchPayments(filters)) as CrpPaymentRecord[];
 
   const match = rows.find((row) => {
     const asset = row.asset;
+    const rowNetwork = String((row as any).network ?? "").trim();
+
     return (
       row.nonce === input.nonce &&
       row.amount === input.amount &&
+      netCands.includes(rowNetwork) &&
       asset.type === input.asset.type &&
       asset.tokenId === input.asset.tokenId &&
       Number(asset.decimals) === Number(input.asset.decimals)
@@ -224,6 +235,11 @@ async function findExactMatch(input: PaymentMatchInput): Promise<CrpPaymentRecor
  * - If unclaimed: insert (merchant_id, nonce) and succeed.
  * - If already claimed by SAME (merchant_id, nonce): succeed (idempotent).
  * - If already claimed by DIFFERENT (merchant_id, nonce): conflict.
+ *
+ * IMPORTANT (CAIP-2 migration):
+ * - We must treat legacy network keys as equivalent. So we:
+ *   1) Insert with a canonicalized network when possible
+ *   2) Resolve ownership by looking up with ALL candidate network strings
  */
 async function claimPltEvent(args: {
   client: any;
@@ -240,6 +256,9 @@ async function claimPltEvent(args: {
 > {
   const { client, network, networkGenesisIndex, txHash, eventIndex, merchantId, nonce } = args;
 
+  const canonical = normalizeNetworkId(network);
+  const netCands = networkCandidates(canonical);
+
   const res = await client.query(
     `
     WITH ins AS (
@@ -254,13 +273,13 @@ async function claimPltEvent(args: {
     UNION ALL
     SELECT merchant_id, nonce, false AS inserted
     FROM public.crp_plt_event_claims
-    WHERE network = $1
+    WHERE network = ANY($7)
       AND network_genesis_index = $2
       AND tx_hash = $3
       AND event_index = $4
     LIMIT 1;
     `,
-    [network, networkGenesisIndex, txHash, eventIndex, merchantId, nonce]
+    [canonical, networkGenesisIndex, txHash, eventIndex, merchantId, nonce, netCands]
   );
 
   if ((res.rowCount ?? 0) === 0) {
@@ -297,7 +316,7 @@ export default async function routes(server: FastifyInstance) {
           : undefined,
       network:
         typeof q.network === "string" && q.network.trim() !== ""
-          ? q.network.trim()
+          ? normalizeNetworkId(q.network.trim())
           : undefined,
       tokenId:
         typeof q.tokenId === "string" && q.tokenId.trim() !== ""
@@ -344,10 +363,13 @@ export default async function routes(server: FastifyInstance) {
       toOptionalGenesisIndex((body as any).network_genesis_index) ??
       undefined;
 
+    const rawNetwork = toCrpNetwork(body.network);
+    const network = normalizeNetworkId(rawNetwork);
+
     const input: CrpMatchRequest = {
       merchantId: String(body.merchantId ?? "").trim(),
       nonce: String(body.nonce ?? "").trim(),
-      network: toCrpNetwork(body.network),
+      network: network as CrpNetwork,
       asset: toCrpAsset(body.asset),
       amount: String(body.amount ?? "").trim(),
       payTo: String(body.payTo ?? "").trim(),
@@ -391,13 +413,6 @@ export default async function routes(server: FastifyInstance) {
   //
   // POST /v1/crp/payments/fulfill
   //
-  // Uses the same exact-tuple match as /payments/match, but:
-  // - Intended as the "fulfill" entrypoint for the gateway.
-  // - M4.2: event-proof gating (default ON unless requireEvent=false/0).
-  // - M4.3: generate receipt + persist receipt + flip status to fulfilled.
-  // - NEW: claim chain event in public.crp_plt_event_claims so it can't be reused across nonces.
-  // - Triggers a webhook POST (if configured) with the updated payment.
-  //
   server.post("/payments/fulfill", async (req, reply) => {
     const body = (req.body || {}) as Partial<CrpFulfillRequest> & { [k: string]: unknown };
 
@@ -410,10 +425,14 @@ export default async function routes(server: FastifyInstance) {
       toOptionalGenesisIndex((body as any).network_genesis_index) ??
       undefined;
 
+    const rawNetwork = toCrpNetwork(body.network);
+    const network = normalizeNetworkId(rawNetwork);
+    const netCands = networkCandidates(network);
+
     const input: CrpFulfillRequest = {
       merchantId: String(body.merchantId ?? "").trim(),
       nonce: String(body.nonce ?? "").trim(),
-      network: toCrpNetwork(body.network),
+      network: network as CrpNetwork,
       asset: toCrpAsset(body.asset),
       amount: String(body.amount ?? "").trim(),
       payTo: String(body.payTo ?? "").trim(),
@@ -487,7 +506,7 @@ export default async function routes(server: FastifyInstance) {
       }
 
       pltEvent = await findMatchingPltEvent({
-        network: input.network,
+        networkCandidates: netCands,
         networkGenesisIndex: norm.networkGenesisIndex,
         tokenId: input.asset.tokenId,
         payTo: input.payTo,
@@ -499,7 +518,7 @@ export default async function routes(server: FastifyInstance) {
           ok: false,
           reason: "no_event",
           count: 0,
-          match, // tuple match exists, but event proof missing
+          match,
           required: {
             network: input.network,
             networkGenesisIndex: norm.networkGenesisIndex,
@@ -516,13 +535,16 @@ export default async function routes(server: FastifyInstance) {
         };
       }
 
+      // Canonicalize the event’s network for receipts/claims (bridges legacy rows)
+      const eventNetworkCanonical = normalizeNetworkId(pltEvent.network);
+
       // Generate canonical receipt payload + sign
       const kid = currentKid();
 
       const unsignedPayload = {
         v: "1",
         challenge_nonce: input.nonce,
-        network: input.network,
+        network: eventNetworkCanonical, // <- canonical CAIP-2 where applicable
         asset: {
           type: input.asset.type,
           tokenId: input.asset.tokenId,
@@ -557,7 +579,7 @@ export default async function routes(server: FastifyInstance) {
 
         const claim = await claimPltEvent({
           client,
-          network: input.network,
+          network: eventNetworkCanonical,
           networkGenesisIndex: norm.networkGenesisIndex,
           txHash: pltEvent.transaction_hash,
           eventIndex: pltEvent.event_index,
@@ -575,13 +597,13 @@ export default async function routes(server: FastifyInstance) {
               reason: "event_claimed",
               count: 0,
               conflict: {
-                network: input.network,
+                network: eventNetworkCanonical,
                 networkGenesisIndex: norm.networkGenesisIndex,
                 tx_hash: pltEvent.transaction_hash,
                 event_index: pltEvent.event_index,
                 claimed_by: claim.owner,
               },
-              match, // tuple match exists but event is already consumed
+              match,
               webhook: { configured: false, attempted: false, ok: false },
             };
           }

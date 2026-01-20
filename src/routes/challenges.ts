@@ -1,6 +1,7 @@
 // src/routes/challenges.ts
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { repo, type Asset, type Status, type Challenge } from "../store";
+import { normalizeNetworkId } from "../lib/networkId";
 
 type ChallengeBody = {
   nonce: string;
@@ -40,14 +41,20 @@ export async function routes(app: FastifyInstance) {
         return reply.code(400).send({ error: "invalid_body", message: "Missing required fields" });
       }
 
-      app.log.info({ merchantId: merchant_id, receivedBody: b }, "DEBUG incoming challenge");
+      // Canonicalize network id (CAIP-2 for Concordium when applicable)
+      const network = normalizeNetworkId(String(b.network ?? "").trim());
+
+      app.log.info(
+        { merchantId: merchant_id, receivedBody: b, normalizedNetwork: network },
+        "DEBUG incoming challenge"
+      );
 
       const payload: Omit<Challenge, "status" | "receipt" | "created_at" | "updated_at"> & {
         status?: Status;
       } = {
         merchant_id,
         nonce: b.nonce,
-        network: b.network,
+        network,
         asset: b.asset,
         amount: b.amount,
         pay_to: b.pay_to,
@@ -101,7 +108,6 @@ export async function routes(app: FastifyInstance) {
       }
 
       const { nonce } = request.params;
-      // Use the repo helper you already have; if it’s named differently, adjust here.
       const row = await repo.getStatus?.(merchant_id, nonce);
       if (!row) {
         return reply.code(404).send({ error: "not_found" });
