@@ -39,32 +39,67 @@ export interface CrpMatchRequest {
 // Fulfill request shares the same tuple as match.
 export type CrpFulfillRequest = CrpMatchRequest;
 
-// === Receipt (Canonical: aligns to schemas/receipt.schema.json) ===
+// === Receipt payload (SHAPED FOR GATEWAY proofPayload.ts) ===
+
+export interface CrpContractRef {
+  contractId: string;
+  contractVersion: string;
+  isFrozen: boolean;
+
+  merchantId: string;
+  resource: {
+    method: string;
+    path: string;
+  };
+
+  // REQUIRED by gateway validator
+  network: string; // e.g. concordium:testnet
+  asset: CrpAsset;
+  amount: string;
+  payTo: string;
+
+  // allow forward-compat extras
+  [k: string]: unknown;
+}
 
 export interface CrpReceiptPayloadV1 {
-  v: "1";
-  challenge_nonce: string;
-  network: string; // schema: ^concordium:(testnet|mainnet)$
-  asset: {
-    type: "PLT";
-    tokenId: string;
-    decimals: number;
+  proofVersion: "ccd-plt-proof@v1";
+  contract: CrpContractRef;
+  nonce: string;
+
+  settlement: {
+    status: "finalized";
+    settledAt: number; // unix seconds
+    expiresAt?: number; // unix seconds
   };
-  amount: string; // decimal string
-  from: string;
-  to: string;
-  tx_hash: string;
-  block_hash: string;
-  finalized_at: string; // date-time
-  compliance: Record<string, unknown>;
-  facilitator_sig: string;     // we'll store the compact JWS here
-  facilitator_key_id: string;  // kid
+
+  chain: {
+    transactionHash: string;
+    blockHash?: string;
+    blockHeight?: number;
+  };
+
+  paymentEvent: {
+    kind: "plt.transfer";
+    tokenId: string;
+    amountRaw: string; // integer string
+    from?: string;
+    to: string;
+  };
+
+  compliance?: Record<string, unknown>;
+
+  // Facilitator extras (gateway ignores unknown keys)
+  facilitator_sig?: string;
+  facilitator_key_id?: string;
+
+  [k: string]: unknown;
 }
 
 // What we store/return on the payment record.
 export interface CrpReceipt {
-  jws: string;                 // compact JWS (header.payload.signature)
-  payload: CrpReceiptPayloadV1; // canonical payload (includes facilitator_sig + key id)
+  jws: string;                  // compact JWS (header.payload.signature)
+  payload: CrpReceiptPayloadV1; // canonical payload
 }
 
 // === Payment record (as returned in responses & webhook) ===
