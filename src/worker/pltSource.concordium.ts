@@ -7,37 +7,25 @@
 // - We use wallet-proxy transaction `id` as that cursor.
 // - When `order=ascending`, wallet-proxy treats `from` as "ids > from".
 //
+// IMPORTANT invariant (bullet-proofing):
+// - We NEVER emit events for tx.id <= lastHeightExclusive, even if an overlap/backfill
+//   window includes them or wallet-proxy changes semantics.
+// - Overlap is only used to increase visibility / self-heal late visibility, but is
+//   combined with strict filtering for "new" txs.
+//
 // NOTE on account address format:
 // In your setup, wallet-proxy rejects strings that start with "ccd1" and
-// accepts the base58-looking form (e.g. "2yV8...").
-// To be user-friendly, we allow either:
+// accepts the base58-looking form.
+// We allow either:
 //   - "2yV8..."          (passes through)
 //   - "ccd12yV8..."      (we strip leading "ccd1" -> "2yV8...")
 
 import { getAccountTransactions as getAccountTransactionsImported } from "../services/walletProxyClient";
 
 export interface ConcordiumNodeConfig {
-  /**
-   * Account address to scan (in the format wallet-proxy accepts).
-   */
   accountAddress: string;
-
-  /**
-   * Logical network name, e.g. "concordium:testnet".
-   * Stored into crp_plt_events.network.
-   */
   network: string;
-
-  /**
-   * Network genesis index, e.g. 6 for Concordium testnet (as seen in /consensus).
-   * Stored into crp_plt_events.network_genesis_index.
-   */
   networkGenesisIndex: number;
-
-  /**
-   * Asset id / token id for PLT, e.g. "EUDemo".
-   * Stored into crp_plt_events.asset_id.
-   */
   assetId: string;
 }
 
@@ -67,11 +55,15 @@ export interface ConcordiumPltScanSummary {
   assetId: string;
   networkGenesisIndex: number;
 
-  cursorFrom: number;
-  cursorBest: number;
+  cursorFrom: number;   // request `from` passed to wallet-proxy
+  cursorInput: number;  // lastHeightExclusive we were asked to fetch since
+  cursorBest: number;   // max tx.id seen in this scan (may equal cursorInput)
 
-  totalSummaries: number;
-  matchedEvents: number;
+  overlap: number;
+
+  totalSummaries: number;     // txs returned from wallet-proxy
+  newSummaries: number;       // txs with id > lastHeightExclusive
+  matchedEvents: number;      // events extracted from newSummaries
 
   sampleEvents: Array<{
     transactionHash: string;
@@ -92,7 +84,6 @@ export interface ConcordiumPltSourceResult {
 }
 
 // Make this robust to different TS typings of walletProxyClient.
-// (At runtime, extra args are harmless even if the function ignores them.)
 type GetAccountTransactionsFn = (...args: any[]) => Promise<any>;
 const getAccountTransactions: GetAccountTransactionsFn =
   getAccountTransactionsImported as unknown as GetAccountTransactionsFn;
@@ -105,11 +96,13 @@ export class ConcordiumPltSource {
 
     const limit = 100;
 
+    const overlap = parseIntEnv("CRP_STREAM_OVERLAP", 0);
+    const cursorFrom = Math.max(0, lastHeightExclusive - Math.max(0, overlap));
+
     let resp: any;
     try {
-      // IMPORTANT: walletProxyClient expects the account address as a string param.
       resp = await getAccountTransactions(accountAddress, {
-        from: lastHeightExclusive,
+        from: cursorFrom,
         limit,
         order: "ascending",
         includeRewards: "none",
@@ -121,25 +114,29 @@ export class ConcordiumPltSource {
 
     const txs: any[] = resp?.transactions ?? [];
 
-    // Forward progress cursor (wallet-proxy tx id)
+    // bestHeight = max id observed in the response (never decreases)
     let bestHeight = lastHeightExclusive;
     for (const tx of txs) {
-      if (typeof tx?.id === "number" && Number.isFinite(tx.id) && tx.id > bestHeight) {
-        bestHeight = tx.id;
-      }
+      const id = typeof tx?.id === "number" && Number.isFinite(tx.id) ? tx.id : null;
+      if (id !== null && id > bestHeight) bestHeight = id;
     }
+
+    // HARD INVARIANT: only process txs that are strictly > cursor (new)
+    const newTxs = txs.filter((tx) => {
+      const id = typeof tx?.id === "number" && Number.isFinite(tx.id) ? tx.id : null;
+      return id !== null && id > lastHeightExclusive;
+    });
 
     const events: ExtractedPltEvent[] = [];
     const sampleEvents: ConcordiumPltScanSummary["sampleEvents"] = [];
 
-    for (const tx of txs) {
+    for (const tx of newTxs) {
       const details: any = tx?.details ?? {};
 
-      // Structured token transfer extraction (wallet-proxy v3 style).
-      // Your real-time tx shows:
-      //   details.type = "tokenUpdate"
-      //   details.tokenId = "EUDemo"
-      //   details.tokenTransferAmount = { decimals: 6, value: "20000" }
+      // wallet-proxy v3 token update style:
+      // details.type = "tokenUpdate"
+      // details.tokenId = "EUDemo"
+      // details.tokenTransferAmount = { decimals: 6, value: "123" }
       const tokenId = typeof details?.tokenId === "string" ? details.tokenId : "";
 
       const tokenAmountValue =
@@ -147,19 +144,13 @@ export class ConcordiumPltSource {
           ? String(details.tokenTransferAmount.value)
           : "";
 
-      const isTokenTransferForAsset =
-        tokenId === assetId && tokenAmountValue.trim() !== "";
-
+      const isTokenTransferForAsset = tokenId === assetId && tokenAmountValue.trim() !== "";
       if (!isTokenTransferForAsset) continue;
 
-      const txId =
-        typeof tx?.id === "number" && Number.isFinite(tx.id) ? tx.id : bestHeight;
+      const txId = typeof tx?.id === "number" && Number.isFinite(tx.id) ? tx.id : bestHeight;
 
       const blockHash = String(tx?.blockHash ?? "");
-      // wallet-proxy often does not return blockHeight for this endpoint; keep 0 if absent.
-      const blockHeight = Number.isFinite(Number(tx?.blockHeight))
-        ? Number(tx.blockHeight)
-        : 0;
+      const blockHeight = Number.isFinite(Number(tx?.blockHeight)) ? Number(tx.blockHeight) : 0;
 
       const transactionHash = String(tx?.transactionHash ?? `id:${txId}`);
       const eventIndex = 0;
@@ -167,16 +158,12 @@ export class ConcordiumPltSource {
       const fromAddress =
         typeof details?.transferSource === "string" ? details.transferSource : null;
       const toAddress =
-        typeof details?.transferDestination === "string"
-          ? details.transferDestination
-          : null;
+        typeof details?.transferDestination === "string" ? details.transferDestination : null;
 
       const occurredAt =
         typeof tx?.blockTime === "number" && Number.isFinite(tx.blockTime)
           ? new Date(tx.blockTime * 1000)
           : new Date();
-
-      const amountRaw = tokenAmountValue;
 
       const ev: ExtractedPltEvent = {
         network,
@@ -192,7 +179,7 @@ export class ConcordiumPltSource {
         fromAddress,
         toAddress,
 
-        amountRaw,
+        amountRaw: tokenAmountValue,
         assetId,
 
         occurredAt,
@@ -219,9 +206,15 @@ export class ConcordiumPltSource {
       network,
       assetId,
       networkGenesisIndex,
-      cursorFrom: lastHeightExclusive,
+
+      cursorFrom,
+      cursorInput: lastHeightExclusive,
       cursorBest: bestHeight,
+
+      overlap,
+
       totalSummaries: txs.length,
+      newSummaries: newTxs.length,
       matchedEvents: events.length,
       sampleEvents,
     };
@@ -256,7 +249,6 @@ function normalizeAccountForWalletProxy(inputRaw: string): { normalized: string;
 export function createConcordiumNodeConfigFromEnv(): ConcordiumNodeConfig {
   const network = process.env.CRP_STREAM_NETWORK ?? "concordium:testnet";
 
-  // Asset id / token id for PLT
   const assetId =
     process.env.CONCORDIUM_PLT_TOKEN_ID ??
     process.env.CRP_STREAM_TOKEN_ID ??

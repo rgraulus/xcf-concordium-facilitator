@@ -2,13 +2,23 @@
 //
 // CRP Payments routes:
 //
+//   POST /v1/crp/payments            (create/reset a challenge row as pending)
 //   GET  /v1/crp/payments/search
 //   POST /v1/crp/payments/match
 //   POST /v1/crp/payments/fulfill
 //
-// - search:  query challenges/payments by tuple filters
-// - match:   pure read, exact tuple match for a payment receipt
-// - fulfill: exact match + (M4.2 event-proof gating) + (M4.3 receipt+persist+status flip) + webhook POST (if configured)
+// Design intent (your “gold tuple” model):
+// - Gateway emits PAYMENT-REQUIRED (the gold tuple).
+// - Facilitator stores that tuple (pending) via POST /payments.
+// - Facilitator fulfills by mirroring the stored tuple into a gateway-proof payload,
+//   then signing it (JWS) and persisting it.
+// - Gateway verifies signature + payload schema + contract binding.
+//
+// IMPORTANT:
+// - The gateway expects the *proof payload* schema (CcdPltProofV1) inside the receipt JWS payload.
+// - That schema is implemented in payfi-gateway-demo/src/proofPayload.ts and is strict.
+//
+// This module emits a proof payload shaped to match that gateway validator.
 //
 // Webhook behaviour:
 // - Merchant-specific env var:
@@ -72,6 +82,16 @@ function asBooleanish(value: unknown): boolean {
 // Keep KID consistent with signer.ts (JWS_KEY_ID preferred, fallback JWS_KID).
 function currentKid(): string {
   return String(process.env.JWS_KEY_ID || process.env.JWS_KID || "kid-dev-1");
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+function isoToUnixSeconds(iso: string): number {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return Math.floor(Date.now() / 1000);
+  return Math.floor(ms / 1000);
 }
 
 type PltEventRow = {
@@ -304,6 +324,99 @@ async function claimPltEvent(args: {
 
 export default async function routes(server: FastifyInstance) {
   //
+  // POST /v1/crp/payments
+  //
+  // Create/reset a pending challenge row from the “gold tuple” emitted by the gateway.
+  //
+  server.post("/payments", async (req, reply) => {
+    const body = (req.body || {}) as any;
+
+    const ngi =
+      toOptionalGenesisIndex(body.networkGenesisIndex) ??
+      toOptionalGenesisIndex(body.network_genesis_index) ??
+      undefined;
+
+    const rawNetwork = toCrpNetwork(body.network);
+    const network = normalizeNetworkId(rawNetwork);
+
+    const input = {
+      merchantId: String(body.merchantId ?? "").trim(),
+      nonce: String(body.nonce ?? "").trim(),
+      network,
+      asset: toCrpAsset(body.asset),
+      amount: String(body.amount ?? "").trim(),
+      payTo: String(body.payTo ?? "").trim(),
+      expiry: body.expiry === undefined || body.expiry === null ? null : String(body.expiry).trim(),
+      policy: isPlainObject(body.policy) ? body.policy : {},
+      metadata: isPlainObject(body.metadata) ? body.metadata : {},
+    };
+
+    if (
+      !input.merchantId ||
+      !input.nonce ||
+      !input.network ||
+      !input.asset.type ||
+      !input.asset.tokenId ||
+      Number.isNaN(input.asset.decimals) ||
+      !input.amount ||
+      !input.payTo
+    ) {
+      reply.code(400);
+      return { ok: false, reason: "bad_request", error: "Missing or invalid required fields" };
+    }
+
+    // Normalize/validate decimals via registry if possible.
+    const norm = await normalizeAssetWithRegistry(server, input.network, input.asset, ngi);
+    if (!norm.ok) {
+      if (norm.reason === "asset_disabled") {
+        reply.code(409);
+        return { ok: false, reason: "asset_disabled" };
+      }
+      reply.code(400);
+      return { ok: false, reason: "bad_request", error: norm.error ?? "Invalid asset tuple" };
+    }
+    input.asset = norm.asset;
+
+    // Upsert into challenges as pending + clear receipt.
+    // Assumes uniqueness on (merchant_id, nonce).
+    const res = await pool.query(
+      `
+      INSERT INTO public.challenges
+        (merchant_id, nonce, network, asset, amount, pay_to, expiry, policy, metadata, status, receipt, created_at, updated_at)
+      VALUES
+        ($1, $2, $3, $4::jsonb, $5, $6, $7, $8::jsonb, $9::jsonb, 'pending', NULL, now(), now())
+      ON CONFLICT (merchant_id, nonce)
+      DO UPDATE SET
+        network = EXCLUDED.network,
+        asset = EXCLUDED.asset,
+        amount = EXCLUDED.amount,
+        pay_to = EXCLUDED.pay_to,
+        expiry = EXCLUDED.expiry,
+        policy = EXCLUDED.policy,
+        metadata = EXCLUDED.metadata,
+        status = 'pending',
+        receipt = NULL,
+        updated_at = now()
+      RETURNING
+        merchant_id, nonce, network, asset, amount, pay_to, expiry, policy, metadata, status, receipt, created_at, updated_at
+      `,
+      [
+        input.merchantId,
+        input.nonce,
+        input.network,
+        JSON.stringify(input.asset),
+        input.amount,
+        input.payTo,
+        input.expiry,
+        JSON.stringify(input.policy),
+        JSON.stringify(input.metadata),
+      ]
+    );
+
+    return { ok: true, reason: "created", payment: res.rows[0] };
+  });
+
+  //
   // GET /v1/crp/payments/search
   //
   server.get("/payments/search", async (req, _reply) => {
@@ -488,7 +601,7 @@ export default async function routes(server: FastifyInstance) {
       return { ok: true, reason: "exact_match", count: 1, match, webhook };
     }
 
-    // ---- M4.2 + M4.3: Event-proof gating (default ON) + receipt persistence + event claiming ----
+    // ---- Event-proof gating (default ON) + receipt persistence + event claiming ----
     let pltEvent: PltEventRow | null = null;
 
     if (requireEvent && input.asset.type === "PLT") {
@@ -538,37 +651,72 @@ export default async function routes(server: FastifyInstance) {
       // Canonicalize the event’s network for receipts/claims (bridges legacy rows)
       const eventNetworkCanonical = normalizeNetworkId(pltEvent.network);
 
-      // Generate canonical receipt payload + sign
-      const kid = currentKid();
+      // Pull the “gold tuple” contract from metadata if present (gateway-originated),
+      // but ALWAYS enforce the required fields for gateway validation.
+      const metaContractRaw = (match as any)?.metadata?.contract;
+      const metaContract = isPlainObject(metaContractRaw) ? metaContractRaw : {};
 
-      const unsignedPayload = {
-        v: "1",
-        challenge_nonce: input.nonce,
-        network: eventNetworkCanonical, // <- canonical CAIP-2 where applicable
+      const contract = {
+        contractId: String((metaContract as any).contractId ?? (match as any)?.metadata?.contract?.contractId ?? ""),
+        contractVersion: String((metaContract as any).contractVersion ?? (match as any)?.metadata?.contract?.contractVersion ?? ""),
+        isFrozen: Boolean((metaContract as any).isFrozen ?? true),
+
+        merchantId: String((metaContract as any).merchantId ?? input.merchantId).trim(),
+        resource: {
+          method: String((metaContract as any)?.resource?.method ?? (match as any)?.metadata?.contract?.resource?.method ?? "").trim(),
+          path: String((metaContract as any)?.resource?.path ?? (match as any)?.metadata?.contract?.resource?.path ?? "").trim(),
+        },
+
+        // REQUIRED by gateway validator
+        network: String((metaContract as any).network ?? input.network ?? eventNetworkCanonical).trim(),
         asset: {
-          type: input.asset.type,
+          type: "PLT",
           tokenId: input.asset.tokenId,
           decimals: input.asset.decimals,
         },
-        amount: input.amount,
-        from: pltEvent.from_address ?? "",
-        to: pltEvent.to_address ?? input.payTo,
-        tx_hash: pltEvent.transaction_hash,
-        block_hash: pltEvent.block_hash,
-        finalized_at: pltEvent.occurred_at,
-        compliance: {
-          standard: "x402",
-          source: "crp_plt_events",
-          networkGenesisIndex: pltEvent.network_genesis_index,
-          eventIndex: pltEvent.event_index,
+        amount: String((metaContract as any).amount ?? input.amount).trim(),
+        payTo: String((metaContract as any).payTo ?? input.payTo).trim(),
+      };
+
+      // settlement: finalized + timestamps (unix seconds)
+      const settledAt = isoToUnixSeconds(pltEvent.occurred_at);
+      const expiresAt =
+        (match as any)?.expiry ? isoToUnixSeconds(String((match as any).expiry)) : undefined;
+
+      // Build the gateway-proof payload (CcdPltProofV1 shape)
+      const proofPayload = {
+        proofVersion: "ccd-plt-proof@v1",
+        contract,
+        nonce: input.nonce,
+        settlement: {
+          status: "finalized",
+          settledAt,
+          ...(expiresAt !== undefined ? { expiresAt } : {}),
+        },
+        chain: {
+          transactionHash: pltEvent.transaction_hash,
+          blockHash: pltEvent.block_hash,
+          // blockHeight not available from table today
+        },
+        paymentEvent: {
+          kind: "plt.transfer",
+          tokenId: input.asset.tokenId,
+          amountRaw: amountMinor,
+          ...(pltEvent.from_address ? { from: pltEvent.from_address } : {}),
+          to: input.payTo,
         },
       };
 
-      const jws = signJws(unsignedPayload);
+      // Sign JWS over the proof payload
+      const jws = signJws(proofPayload);
+      const kid = currentKid();
 
-      const fullPayload = {
-        ...unsignedPayload,
-        facilitator_sig: jws,
+      // What we store in DB: keep existing receipt object shape,
+      // but payload MUST be what gateway verifies.
+      // Cast as any to avoid TS type mismatch if your CrpReceiptPayloadV1 still reflects the older schema.
+      const receiptObj: any = {
+        jws,
+        payload: proofPayload,
         facilitator_key_id: kid,
       };
 
@@ -616,8 +764,6 @@ export default async function routes(server: FastifyInstance) {
             webhook: { configured: false, attempted: false, ok: false },
           };
         }
-
-        const receiptObj = { jws, payload: fullPayload };
 
         const upd = await client.query(
           `

@@ -13,7 +13,7 @@ import { insertPltTransfers, PltEventInsertInput } from "../store/plt.pg";
 import { getLatestAccountTransactionId } from "../services/walletProxyClient";
 
 const DEFAULT_POLL_INTERVAL_MS = 1000;
-const DEFAULT_MAX_TICKS = 0; // 0 = run forever (deterministic default)
+const DEFAULT_MAX_TICKS = 0; // 0 = run forever
 
 type SourceKind = "concordium" | "fixture";
 
@@ -29,10 +29,14 @@ interface WorkerConfig {
   sourceKind: SourceKind;
 
   // Cursor hygiene
-  zeroIsGenesis: boolean;           // if true, startHeightOverride=0 means "from genesis"
-  maxAheadGuard: number;            // if cursor > latest+guard => clamp
-  rewindOnClamp: number;            // clamp cursor to latest - rewind
-  persistCursorInDryRun: boolean;   // default false
+  zeroIsGenesis: boolean;
+  maxAheadGuard: number;
+  rewindOnClamp: number;
+  persistCursorInDryRun: boolean;
+
+  // Logging hygiene
+  quietWhenNoProgress: boolean; // default true
+  heartbeatEveryTicks: number;  // default 10
 }
 
 function parseIntEnv(name: string, defaultValue: number): number {
@@ -53,16 +57,12 @@ function parseBoolEnv(name: string, defaultValue: boolean): boolean {
 
 function loadWorkerConfigFromEnv(): WorkerConfig {
   const pollIntervalMs = parseIntEnv("CRP_STREAM_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL_MS);
-
-  // 0 means run forever.
   const maxTicks = parseIntEnv("CRP_STREAM_MAX_TICKS", DEFAULT_MAX_TICKS);
-
   const dryRun = parseBoolEnv("CRP_STREAM_DRY_RUN", false);
 
   // Persistent safety: ignore CRP_STREAM_LAST_HEIGHT unless explicitly enabled.
   const useLastHeightOverride = parseBoolEnv("CRP_STREAM_USE_LAST_HEIGHT_OVERRIDE", false);
 
-  // Helpful visibility if the var is set but the gate is off.
   if (!useLastHeightOverride && Object.prototype.hasOwnProperty.call(process.env, "CRP_STREAM_LAST_HEIGHT")) {
     const raw = process.env.CRP_STREAM_LAST_HEIGHT;
     if (raw !== undefined && raw !== null && String(raw).trim() !== "") {
@@ -89,6 +89,10 @@ function loadWorkerConfigFromEnv(): WorkerConfig {
   const rewindOnClamp = parseIntEnv("CRP_STREAM_CURSOR_REWIND", 5);
   const persistCursorInDryRun = parseBoolEnv("CRP_STREAM_PERSIST_CURSOR_IN_DRY_RUN", false);
 
+  // Logging hygiene defaults
+  const quietWhenNoProgress = parseBoolEnv("CRP_STREAM_QUIET_NO_PROGRESS", true);
+  const heartbeatEveryTicks = parseIntEnv("CRP_STREAM_HEARTBEAT_TICKS", 10);
+
   return {
     pollIntervalMs,
     dryRun,
@@ -99,6 +103,8 @@ function loadWorkerConfigFromEnv(): WorkerConfig {
     maxAheadGuard,
     rewindOnClamp,
     persistCursorInDryRun,
+    quietWhenNoProgress,
+    heartbeatEveryTicks,
   };
 }
 
@@ -141,7 +147,6 @@ async function readCursor(cursorKey: string): Promise<number | null> {
 }
 
 async function upsertCursor(cursorKey: string, lastHeight: number): Promise<void> {
-  // Monotonic update: never move backwards.
   await pool.query(
     `
     INSERT INTO public.crp_stream_cursors (cursor_key, last_height, updated_at)
@@ -155,8 +160,6 @@ async function upsertCursor(cursorKey: string, lastHeight: number): Promise<void
 }
 
 function buildCursorKeyForConcordium(cfg: ReturnType<typeof createConcordiumNodeConfigFromEnv>): string {
-  // Matches what you queried earlier:
-  // plt:concordium:<network>:<genesisIndex>:<assetId>:<account>
   return `plt:concordium:${cfg.network}:${cfg.networkGenesisIndex}:${cfg.assetId}:${cfg.accountAddress}`;
 }
 
@@ -170,10 +173,6 @@ async function resolveStartCursor(
 
   const dbCursor = await readCursor(cursorKey);
 
-  // Precedence:
-  // 1) CRP_STREAM_LAST_HEIGHT (explicit override, gated)
-  // 2) DB cursor
-  // 3) 0 (implicit)
   let start = 0;
   let startSource = "implicit(0)";
 
@@ -185,12 +184,10 @@ async function resolveStartCursor(
     startSource = "db(crp_stream_cursors)";
   }
 
-  // For concordium, make 0 mean "from now" unless explicitly configured otherwise.
   if (sourceKind === "concordium" && accountForLatestId) {
     const latestId = await getLatestAccountTransactionId(accountForLatestId);
 
     if (latestId > 0) {
-      // Clamp out-of-universe cursor (e.g., DB says 36M but latest is 3M)
       if (start > latestId + workerCfg.maxAheadGuard) {
         const clamped = Math.max(0, latestId - workerCfg.rewindOnClamp);
         console.log(
@@ -206,7 +203,6 @@ async function resolveStartCursor(
         await upsertCursor(cursorKey, start);
       }
 
-      // If start is 0 and zeroIsGenesis=false, treat as "from now"
       if (start === 0 && !workerCfg.zeroIsGenesis) {
         console.log(
           "[CRP-STREAM] start cursor=0 treated as 'from now' (latestId=%d). Setting cursor to latestId.",
@@ -236,6 +232,8 @@ async function runWorker(
     maxTicks: cfg.maxTicks,
     sourceKind: cfg.sourceKind,
     cursorKey,
+    quietWhenNoProgress: cfg.quietWhenNoProgress,
+    heartbeatEveryTicks: cfg.heartbeatEveryTicks,
   });
 
   let tick = 0;
@@ -261,17 +259,30 @@ async function runWorker(
       break;
     }
 
-    // Fetch
-    const { events, bestHeight } = await source.fetchSince(state.lastHeightExclusive);
+    const prevCursor = state.lastHeightExclusive;
 
-    console.log(
-      "[CRP-STREAM] fetched %d PLT event(s) above cursor %d (best=%d)",
-      events.length,
-      state.lastHeightExclusive,
-      bestHeight
-    );
+    // Fetch (source may internally apply overlap/backfill; that's fine)
+    const { events, bestHeight } = await source.fetchSince(prevCursor);
 
-    // Insert (if any)
+    // Cursor advance decision: ONLY treat as progress if bestHeight > prevCursor
+    const advanced = Number.isFinite(bestHeight) && bestHeight > prevCursor;
+
+    // If no progress, don't spam logs every tick.
+    if (!advanced && cfg.quietWhenNoProgress) {
+      if (cfg.heartbeatEveryTicks > 0 && tick % cfg.heartbeatEveryTicks === 0) {
+        console.log("[CRP-STREAM] heartbeat: no new PLT txs. cursor=%d (events_seen_in_overlap=%d)", prevCursor, events.length);
+      }
+    } else {
+      console.log(
+        "[CRP-STREAM] fetched %d PLT event(s) (cursor=%d best=%d advanced=%s)",
+        events.length,
+        prevCursor,
+        bestHeight,
+        advanced ? "yes" : "no"
+      );
+    }
+
+    // Insert (only log details if we are making progress or there are actual events)
     if (events.length > 0) {
       const rows: PltEventInsertInput[] = events.map((ev) => ({
         block_hash: ev.blockHash,
@@ -295,28 +306,33 @@ async function runWorker(
 
       if (!cfg.dryRun) {
         const { inserted } = await insertPltTransfers(rows);
-        const last = rows[rows.length - 1];
-        console.log("[CRP-STREAM] inserted PLT events:", {
-          inserted,
-          last: {
-            block_height: last.block_height,
-            transaction_hash: last.transaction_hash,
-            asset_id: last.asset_id,
-            amount_raw: last.amount_raw,
-          },
-        });
-      } else {
+
+        // Only print the detailed “inserted/last” line when:
+        // - we actually inserted something OR
+        // - we advanced the cursor (i.e., something new happened)
+        if (inserted > 0 || advanced || !cfg.quietWhenNoProgress) {
+          const last = rows[rows.length - 1];
+          console.log("[CRP-STREAM] insert result:", {
+            inserted,
+            last: {
+              block_height: last.block_height,
+              transaction_hash: last.transaction_hash,
+              asset_id: last.asset_id,
+              amount_raw: last.amount_raw,
+            },
+          });
+        }
+      } else if (!cfg.quietWhenNoProgress) {
         console.log("[CRP-STREAM] dryRun=true, would insert rows:", rows.length);
       }
     }
 
-    // Advance in-memory cursor
-    const prev = state.lastHeightExclusive;
-    state.lastHeightExclusive = bestHeight;
+    // Advance cursor only if bestHeight indicates progress.
+    if (advanced) {
+      state.lastHeightExclusive = bestHeight;
 
-    // Persist cursor (monotonic)
-    if (!cfg.dryRun || cfg.persistCursorInDryRun) {
-      if (bestHeight !== prev) {
+      // Persist cursor (monotonic)
+      if (!cfg.dryRun || cfg.persistCursorInDryRun) {
         await upsertCursor(cursorKey, bestHeight);
       }
     }
@@ -336,6 +352,8 @@ export async function runDemo(): Promise<void> {
     startHeightOverride: cfg.startHeightOverride,
     maxTicks: cfg.maxTicks,
     sourceKind: cfg.sourceKind,
+    quietWhenNoProgress: cfg.quietWhenNoProgress,
+    heartbeatEveryTicks: cfg.heartbeatEveryTicks,
   });
 
   let source: PltSource;
@@ -345,7 +363,6 @@ export async function runDemo(): Promise<void> {
   if (cfg.sourceKind === "fixture") {
     source = createFixtureSourceFromEnv();
     cursorKey = "plt:fixture";
-    // fixture: no external notion of "latest id"
     startCursor = await resolveStartCursor(cfg, "fixture", cursorKey);
   } else {
     const nodeCfg = createConcordiumNodeConfigFromEnv();
@@ -366,7 +383,6 @@ if (require.main === module) {
       process.exitCode = 1;
     })
     .finally(async () => {
-      // allow clean exit for one-shot modes
       try {
         await pool.end();
       } catch {
