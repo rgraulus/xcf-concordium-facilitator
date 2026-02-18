@@ -18,8 +18,6 @@
 // - The gateway expects the *proof payload* schema (CcdPltProofV1) inside the receipt JWS payload.
 // - That schema is implemented in payfi-gateway-demo/src/proofPayload.ts and is strict.
 //
-// This module emits a proof payload shaped to match that gateway validator.
-//
 // Webhook behaviour:
 // - Merchant-specific env var:
 //
@@ -34,6 +32,12 @@
 //
 // - On network/timeout/non-2xx:
 //     webhook: { configured: true, attempted: true, ok: false, status?, error? }
+//
+// CHANGE (TX-CORRELATED PLT FULFILL):
+// - For PLT fulfillment with requireEvent=true (default), we REQUIRE txHash and use it as the
+//   authoritative correlator to select the exact chain event to claim.
+// - This prevents ambiguous tuple-only matching when the same (to, amount, token) repeats,
+//   which otherwise can select an older event and produce persistent 409 conflicts.
 //
 
 import type { FastifyInstance } from "fastify";
@@ -79,6 +83,15 @@ function asBooleanish(value: unknown): boolean {
   return s === "1" || s === "true" || s === "yes" || s === "y" || s === "on";
 }
 
+function toOptionalTxHash(raw: unknown): string | undefined {
+  const s = String(raw ?? "").trim();
+  if (!s) return undefined;
+  // tx hashes are hex strings; be permissive but guard against obvious junk
+  const hex = s.toLowerCase();
+  if (!/^[0-9a-f]{32,128}$/.test(hex)) return s; // don't hard-fail; may be chain-specific formatting
+  return hex;
+}
+
 // Keep KID consistent with signer.ts (JWS_KEY_ID preferred, fallback JWS_KID).
 function currentKid(): string {
   return String(process.env.JWS_KEY_ID || process.env.JWS_KID || "kid-dev-1");
@@ -103,6 +116,7 @@ type PltEventRow = {
   occurred_at: string; // ISO
   event_index: number;
   network_genesis_index: number;
+  block_height?: number | null;
 };
 
 async function findMatchingPltEvent(args: {
@@ -124,14 +138,17 @@ async function findMatchingPltEvent(args: {
       block_hash,
       occurred_at,
       event_index,
-      network_genesis_index
+      network_genesis_index,
+      block_height
     FROM public.crp_plt_events
     WHERE network = ANY($1)
       AND network_genesis_index = $2
       AND asset_id = $3
       AND to_address = $4
       AND amount_raw::text = $5
-    ORDER BY occurred_at DESC
+    -- Optional 1-liner upgrade:
+    -- Prefer chain-deterministic ordering over occurred_at timestamp ordering.
+    ORDER BY block_height DESC, event_index DESC
     LIMIT 1
     `,
     [nets, networkGenesisIndex, tokenId, payTo, amountMinor]
@@ -149,6 +166,66 @@ async function findMatchingPltEvent(args: {
     occurred_at: new Date(r.occurred_at).toISOString(),
     event_index: Number(r.event_index ?? 0),
     network_genesis_index: Number(r.network_genesis_index ?? networkGenesisIndex),
+    block_height: r.block_height === undefined || r.block_height === null ? null : Number(r.block_height),
+  };
+}
+
+/**
+ * TX-correlated lookup: find a specific PLT transfer event by tx hash.
+ *
+ * NOTE:
+ * - We still filter by to/token/amount/genesis to ensure the tx we claim matches the tuple.
+ * - This prevents a tx with multiple events (or unrelated event types) from being used incorrectly.
+ */
+async function findPltEventByTx(args: {
+  networkCandidates: string[];
+  networkGenesisIndex: number;
+  tokenId: string;
+  payTo: string;
+  amountMinor: string;
+  txHash: string;
+}): Promise<PltEventRow | null> {
+  const { networkCandidates: nets, networkGenesisIndex, tokenId, payTo, amountMinor, txHash } = args;
+
+  const res = await pool.query(
+    `
+    SELECT
+      network,
+      from_address,
+      to_address,
+      transaction_hash,
+      block_hash,
+      occurred_at,
+      event_index,
+      network_genesis_index,
+      block_height
+    FROM public.crp_plt_events
+    WHERE network = ANY($1)
+      AND network_genesis_index = $2
+      AND asset_id = $3
+      AND to_address = $4
+      AND amount_raw::text = $5
+      AND transaction_hash = $6
+      AND event_type = 'transfer'
+    ORDER BY event_index ASC
+    LIMIT 1
+    `,
+    [nets, networkGenesisIndex, tokenId, payTo, amountMinor, txHash]
+  );
+
+  if ((res.rowCount ?? 0) === 0) return null;
+
+  const r = res.rows[0];
+  return {
+    network: String(r.network),
+    from_address: r.from_address ? String(r.from_address) : null,
+    to_address: r.to_address ? String(r.to_address) : null,
+    transaction_hash: String(r.transaction_hash),
+    block_hash: String(r.block_hash),
+    occurred_at: new Date(r.occurred_at).toISOString(),
+    event_index: Number(r.event_index ?? 0),
+    network_genesis_index: Number(r.network_genesis_index ?? networkGenesisIndex),
+    block_height: r.block_height === undefined || r.block_height === null ? null : Number(r.block_height),
   };
 }
 
@@ -163,7 +240,12 @@ async function normalizeAssetWithRegistry(
   asset: CrpAsset,
   networkGenesisIndex?: number
 ): Promise<
-  | { ok: true; asset: CrpAsset; networkGenesisIndex: number; decimalsSource: "db(crp_plt_assets)" | "provided(decimals)" }
+  | {
+      ok: true;
+      asset: CrpAsset;
+      networkGenesisIndex: number;
+      decimalsSource: "db(crp_plt_assets)" | "provided(decimals)";
+    }
   | { ok: false; reason: "asset_disabled" | "bad_request"; error?: string }
 > {
   const ngi = Number.isFinite(Number(networkGenesisIndex))
@@ -542,6 +624,9 @@ export default async function routes(server: FastifyInstance) {
     const network = normalizeNetworkId(rawNetwork);
     const netCands = networkCandidates(network);
 
+    // txHash is REQUIRED for PLT fulfill when requireEvent=true
+    const txHash = toOptionalTxHash((body as any).txHash ?? (body as any).tx_hash);
+
     const input: CrpFulfillRequest = {
       merchantId: String(body.merchantId ?? "").trim(),
       nonce: String(body.nonce ?? "").trim(),
@@ -549,7 +634,8 @@ export default async function routes(server: FastifyInstance) {
       asset: toCrpAsset(body.asset),
       amount: String(body.amount ?? "").trim(),
       payTo: String(body.payTo ?? "").trim(),
-    };
+      // NOTE: CrpFulfillRequest may not include txHash in its type; we read it from body above.
+    } as any;
 
     if (
       !input.merchantId ||
@@ -563,6 +649,17 @@ export default async function routes(server: FastifyInstance) {
     ) {
       reply.code(400);
       return { ok: false, reason: "bad_request", error: "Missing or invalid required fields" };
+    }
+
+    // Enforce txHash for PLT when event-proof gating is on.
+    if (requireEvent && input.asset.type === "PLT" && !txHash) {
+      reply.code(400);
+      return {
+        ok: false,
+        reason: "bad_request",
+        error: "txHash is required for PLT fulfillment when requireEvent=true",
+        webhook: { configured: false, attempted: false, ok: false },
+      };
     }
 
     const norm = await normalizeAssetWithRegistry(server, input.network, input.asset, ngi);
@@ -618,12 +715,14 @@ export default async function routes(server: FastifyInstance) {
         };
       }
 
-      pltEvent = await findMatchingPltEvent({
+      // TX-correlated event selection (authoritative)
+      pltEvent = await findPltEventByTx({
         networkCandidates: netCands,
         networkGenesisIndex: norm.networkGenesisIndex,
         tokenId: input.asset.tokenId,
         payTo: input.payTo,
         amountMinor,
+        txHash: txHash!,
       });
 
       if (!pltEvent) {
@@ -638,6 +737,7 @@ export default async function routes(server: FastifyInstance) {
             tokenId: input.asset.tokenId,
             to: input.payTo,
             amountMinor,
+            txHash: txHash!,
           },
           resolved: {
             decimals: input.asset.decimals,
@@ -657,14 +757,28 @@ export default async function routes(server: FastifyInstance) {
       const metaContract = isPlainObject(metaContractRaw) ? metaContractRaw : {};
 
       const contract = {
-        contractId: String((metaContract as any).contractId ?? (match as any)?.metadata?.contract?.contractId ?? ""),
-        contractVersion: String((metaContract as any).contractVersion ?? (match as any)?.metadata?.contract?.contractVersion ?? ""),
+        contractId: String(
+          (metaContract as any).contractId ?? (match as any)?.metadata?.contract?.contractId ?? ""
+        ),
+        contractVersion: String(
+          (metaContract as any).contractVersion ??
+            (match as any)?.metadata?.contract?.contractVersion ??
+            ""
+        ),
         isFrozen: Boolean((metaContract as any).isFrozen ?? true),
 
         merchantId: String((metaContract as any).merchantId ?? input.merchantId).trim(),
         resource: {
-          method: String((metaContract as any)?.resource?.method ?? (match as any)?.metadata?.contract?.resource?.method ?? "").trim(),
-          path: String((metaContract as any)?.resource?.path ?? (match as any)?.metadata?.contract?.resource?.path ?? "").trim(),
+          method: String(
+            (metaContract as any)?.resource?.method ??
+              (match as any)?.metadata?.contract?.resource?.method ??
+              ""
+          ).trim(),
+          path: String(
+            (metaContract as any)?.resource?.path ??
+              (match as any)?.metadata?.contract?.resource?.path ??
+              ""
+          ).trim(),
         },
 
         // REQUIRED by gateway validator
@@ -680,8 +794,7 @@ export default async function routes(server: FastifyInstance) {
 
       // settlement: finalized + timestamps (unix seconds)
       const settledAt = isoToUnixSeconds(pltEvent.occurred_at);
-      const expiresAt =
-        (match as any)?.expiry ? isoToUnixSeconds(String((match as any).expiry)) : undefined;
+      const expiresAt = (match as any)?.expiry ? isoToUnixSeconds(String((match as any).expiry)) : undefined;
 
       // Build the gateway-proof payload (CcdPltProofV1 shape)
       const proofPayload = {
@@ -696,7 +809,9 @@ export default async function routes(server: FastifyInstance) {
         chain: {
           transactionHash: pltEvent.transaction_hash,
           blockHash: pltEvent.block_hash,
-          // blockHeight not available from table today
+          ...(pltEvent.block_height !== undefined && pltEvent.block_height !== null
+            ? { blockHeight: pltEvent.block_height }
+            : {}),
         },
         paymentEvent: {
           kind: "plt.transfer",
