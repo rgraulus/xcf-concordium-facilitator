@@ -1,7 +1,7 @@
 services:
   testnet-node:
     container_name: xcf-testnet-node
-    image: concordium/testnet-node:latest
+    image: concordium/testnet-node:10.0.4-1
     platform: linux/amd64
     pull_policy: always
     restart: unless-stopped
@@ -32,7 +32,7 @@ services:
 
   testnet-node-collector:
     container_name: xcf-testnet-node-collector
-    image: concordium/testnet-node:latest
+    image: concordium/testnet-node:10.0.4-1
     platform: linux/amd64
     pull_policy: always
     restart: unless-stopped
