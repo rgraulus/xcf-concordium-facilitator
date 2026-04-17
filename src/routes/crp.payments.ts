@@ -495,7 +495,16 @@ export default async function routes(server: FastifyInstance) {
       ]
     );
 
-    return { ok: true, reason: "created", payment: res.rows[0] };
+    return {
+      ok: true,
+      reason: "created",
+      payment: {
+        ...res.rows[0],
+        chain_id: normalizeNetworkId(String(res.rows[0].network ?? "").trim()).startsWith("ccd:")
+          ? normalizeNetworkId(String(res.rows[0].network ?? "").trim())
+          : undefined,
+      },
+    };
   });
 
   //
@@ -535,6 +544,10 @@ export default async function routes(server: FastifyInstance) {
       filters: {
         merchantId: filters.merchantId,
         network: filters.network,
+        chain_id:
+          typeof filters.network === "string" && filters.network.trim() !== "" && filters.network.startsWith("ccd:")
+            ? filters.network
+            : undefined,
         tokenId: filters.tokenId,
         payTo: filters.payTo,
         status: filters.status,
@@ -602,7 +615,17 @@ export default async function routes(server: FastifyInstance) {
       return { ok: false, reason: "no_match", count: 0 };
     }
 
-    return { ok: true, reason: "exact_match", count: 1, match };
+    return {
+      ok: true,
+      reason: "exact_match",
+      count: 1,
+      match: {
+        ...match,
+        chain_id: normalizeNetworkId(String((match as any).network ?? "").trim()).startsWith("ccd:")
+          ? normalizeNetworkId(String((match as any).network ?? "").trim())
+          : undefined,
+      },
+    };
   });
 
   //
@@ -690,12 +713,18 @@ export default async function routes(server: FastifyInstance) {
 
     // If already fulfilled with a receipt, treat as idempotent success.
     if (match.status === "fulfilled" && (match as any)?.receipt?.jws) {
+      const matchWithChainId = {
+        ...match,
+        chain_id: normalizeNetworkId(String((match as any).network ?? "").trim()).startsWith("ccd:")
+          ? normalizeNetworkId(String((match as any).network ?? "").trim())
+          : undefined,
+      };
       const webhookPayload: CrpWebhookPayload = {
         kind: "crp.payment.fulfilled",
-        payment: match,
+        payment: matchWithChainId as any,
       };
       const webhook = await postPaymentWebhook(input.merchantId, webhookPayload);
-      return { ok: true, reason: "exact_match", count: 1, match, webhook };
+      return { ok: true, reason: "exact_match", count: 1, match: matchWithChainId, webhook };
     }
 
     // ---- Event-proof gating (default ON) + receipt persistence + event claiming ----
