@@ -2,7 +2,8 @@
  * src/lib/networkId.ts
  *
  * Goal:
- * - Accept both legacy "concordium:testnet" and CAIP-2 "ccd:<genesisHash>"
+ * - Accept both legacy "concordium:testnet" / "concordium:mainnet"
+ *   and CAIP-2 "ccd:<genesisHash>"
  * - Normalize where possible
  * - Provide candidate lists so DB lookups match legacy rows during migration
  *
@@ -10,6 +11,9 @@
  * - We hardcode Concordium Testnet/Mainnet genesis hashes (can be extended).
  * - If you want this to be fully dynamic later, we can add env-based alias config.
  */
+
+export const CONCORDIUM_TESTNET_CHAIN_ID = "ccd:4221332d34e1694168c2a0c0b3fd0f27";
+export const CONCORDIUM_MAINNET_CHAIN_ID = "ccd:9dd9ca4d19e9393877d2c44b70f89acb";
 
 export function normalizeNetworkId(raw: string): string {
   const s = String(raw ?? "").trim();
@@ -48,22 +52,24 @@ export function networkCandidates(raw: string): string[] {
 
   // Map CAIP-2 to legacy, where we know the genesis hash.
   if (normalized.startsWith("ccd:")) {
-    const genesis = normalized.slice("ccd:".length);
-
-    // Concordium Testnet genesis (matches what you've been using: ccd:4221332d34e1694168c2a0c0b3fd0f27)
-    if (genesis === "4221332d34e1694168c2a0c0b3fd0f27") {
+    // Concordium Testnet genesis
+    if (normalized === CONCORDIUM_TESTNET_CHAIN_ID) {
       out.add("concordium:testnet");
     }
 
-    // Concordium Mainnet genesis (add/verify later if/when you need it)
-    // out.add("concordium:mainnet") for known mainnet genesis hash (fill in when confirmed)
+    // Concordium Mainnet genesis
+    if (normalized === CONCORDIUM_MAINNET_CHAIN_ID) {
+      out.add("concordium:mainnet");
+    }
   }
 
   // Map legacy to CAIP-2 when known.
   if (normalized === "concordium:testnet") {
-    out.add("ccd:4221332d34e1694168c2a0c0b3fd0f27");
+    out.add(CONCORDIUM_TESTNET_CHAIN_ID);
   }
-  // if (normalized === "concordium:mainnet") { out.add("ccd:<mainnetGenesis>"); }
+  if (normalized === "concordium:mainnet") {
+    out.add(CONCORDIUM_MAINNET_CHAIN_ID);
+  }
 
   return Array.from(out);
 }
