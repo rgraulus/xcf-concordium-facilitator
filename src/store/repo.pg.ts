@@ -1,5 +1,6 @@
 // src/store/repo.pg.ts
 import { pool } from "../db/pool";
+import { normalizeNetworkId, networkCandidates } from "../lib/networkId";
 
 /** Types */
 export type Status =
@@ -48,6 +49,18 @@ function toChallengeRow(row: any): Challenge {
     created_at: new Date(row.created_at).toISOString(),
     updated_at: new Date(row.updated_at).toISOString(),
   };
+}
+
+function networksEquivalent(a: string, b: string): boolean {
+  const left = normalizeNetworkId(a);
+  const right = normalizeNetworkId(b);
+
+  if (left === right) {
+    return true;
+  }
+
+  const leftCandidates = new Set(networkCandidates(left));
+  return leftCandidates.has(right);
 }
 
 /**
@@ -113,7 +126,7 @@ export async function upsertChallenge(
   if ((sel.rowCount ?? 0) > 0) {
     const row = sel.rows[0];
     const same =
-      row.network === network &&
+      networksEquivalent(String(row.network ?? ""), String(network ?? "")) &&
       JSON.stringify(row.asset) === JSON.stringify(asset) &&
       row.amount === amount &&
       row.pay_to === pay_to &&
