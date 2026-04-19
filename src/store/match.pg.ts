@@ -8,6 +8,7 @@
 // PLT parser is fully wired up.
 
 import { pool } from "../db/pool";
+import { networkCandidates } from "../lib/networkId";
 import type { Asset, Status, Challenge } from "./repo.pg";
 
 /**
@@ -19,6 +20,7 @@ import type { Asset, Status, Challenge } from "./repo.pg";
 export type PaymentSearchFilters = {
   merchantId?: string;
   network?: string;
+  networkCandidates?: string[];
   tokenId?: string; // asset.tokenId (from JSONB column `asset`)
   payTo?: string;
   status?: Status;
@@ -65,11 +67,19 @@ export async function searchPayments(
   const {
     merchantId,
     network,
+    networkCandidates: explicitNetworkCandidates,
     tokenId,
     payTo,
     status,
     limit,
   } = filters;
+
+  const effectiveNetworkCandidates =
+    explicitNetworkCandidates && explicitNetworkCandidates.length > 0
+      ? explicitNetworkCandidates
+      : network
+        ? networkCandidates(network)
+        : [];
 
   const params: any[] = [];
   let where = "WHERE 1=1";
@@ -79,9 +89,12 @@ export async function searchPayments(
     where += ` AND merchant_id = $${params.length}`;
   }
 
-  if (network) {
-    params.push(network);
+  if (effectiveNetworkCandidates.length === 1) {
+    params.push(effectiveNetworkCandidates[0]);
     where += ` AND network = $${params.length}`;
+  } else if (effectiveNetworkCandidates.length > 1) {
+    params.push(effectiveNetworkCandidates);
+    where += ` AND network = ANY($${params.length})`;
   }
 
   if (tokenId) {

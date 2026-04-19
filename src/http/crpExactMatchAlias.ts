@@ -23,6 +23,7 @@
 import type { FastifyPluginCallback } from "fastify";
 import { pool } from "../db/pool";
 import { toMinorUnits } from "../crp/decimals-registry";
+import { normalizeNetworkId, networkCandidates } from "../lib/networkId";
 import { searchPayments, type PaymentSearchFilters } from "../store/match.pg";
 
 // Narrow helper: best-effort string extraction.
@@ -66,6 +67,8 @@ async function resolveDecimalsAndGenesisIndex(
   tokenId: string,
   decimalsFromQuery: number | null
 ): Promise<ResolvedInfo> {
+  const netCands = networkCandidates(network);
+
   // If caller provided decimals explicitly, we still try to resolve genesis index from DB
   // (best-effort), but we won't override decimals.
   if (decimalsFromQuery !== null && Number.isFinite(decimalsFromQuery)) {
@@ -75,12 +78,12 @@ async function resolveDecimalsAndGenesisIndex(
         `
         SELECT network_genesis_index
         FROM public.crp_plt_assets
-        WHERE network = $1
+        WHERE network = ANY($1)
           AND asset_id = $2
         ORDER BY network_genesis_index DESC
         LIMIT 1
         `,
-        [network, tokenId]
+        [netCands, tokenId]
       );
       if ((r.rowCount ?? 0) > 0) {
         ng = Number(r.rows[0].network_genesis_index);
@@ -101,13 +104,13 @@ async function resolveDecimalsAndGenesisIndex(
     `
     SELECT decimals, network_genesis_index
     FROM public.crp_plt_assets
-    WHERE network = $1
+    WHERE network = ANY($1)
       AND asset_id = $2
       AND enabled = TRUE
     ORDER BY network_genesis_index DESC
     LIMIT 1
     `,
-    [network, tokenId]
+    [netCands, tokenId]
   );
 
   if ((res.rowCount ?? 0) > 0) {
@@ -128,26 +131,26 @@ async function resolveDecimalsAndGenesisIndex(
 }
 
 async function hasMatchingPltEvent(args: {
-  network: string;
+  networkCandidates: string[];
   networkGenesisIndex: number;
   tokenId: string;
   payTo: string;
   amountMinor: string;
 }): Promise<boolean> {
-  const { network, networkGenesisIndex, tokenId, payTo, amountMinor } = args;
+  const { networkCandidates: nets, networkGenesisIndex, tokenId, payTo, amountMinor } = args;
 
   const res = await pool.query(
     `
     SELECT 1
     FROM public.crp_plt_events
-    WHERE network = $1
+    WHERE network = ANY($1)
       AND network_genesis_index = $2
       AND asset_id = $3
       AND to_address = $4
       AND amount_raw::text = $5
     LIMIT 1
     `,
-    [network, networkGenesisIndex, tokenId, payTo, amountMinor]
+    [nets, networkGenesisIndex, tokenId, payTo, amountMinor]
   );
 
   return (res.rowCount ?? 0) > 0;
@@ -162,7 +165,9 @@ const crpExactMatchAliasPlugin: FastifyPluginCallback = async (server) => {
       asTrimmedString(q.merchantId) || asTrimmedString(q.merchant_id);
 
     const nonce = asTrimmedString(q.nonce);
-    const network = asTrimmedString(q.network);
+    const rawNetwork = asTrimmedString(q.network);
+    const network = normalizeNetworkId(rawNetwork);
+    const netCands = networkCandidates(network);
 
     const tokenId =
       asTrimmedString(q.tokenId) || asTrimmedString(q.token_id);
@@ -215,6 +220,7 @@ const crpExactMatchAliasPlugin: FastifyPluginCallback = async (server) => {
     const filters: PaymentSearchFilters = {
       merchantId: input.merchantId,
       network: input.network,
+      networkCandidates: netCands,
       tokenId: input.tokenId,
       payTo: input.payTo,
       limit: 100,
@@ -260,7 +266,7 @@ const crpExactMatchAliasPlugin: FastifyPluginCallback = async (server) => {
       }
 
       const found = await hasMatchingPltEvent({
-        network: input.network,
+        networkCandidates: netCands,
         networkGenesisIndex: resolved.networkGenesisIndex,
         tokenId: input.tokenId,
         payTo: input.payTo,
