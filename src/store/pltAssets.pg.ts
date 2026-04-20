@@ -5,6 +5,7 @@
 // without forcing clients to remember decimals.
 
 import { pool } from "../db/pool";
+import { networkCandidates } from "../lib/networkId";
 
 export type PltAssetRow = {
   network: string;
@@ -33,6 +34,8 @@ export async function getPltAsset(
   networkGenesisIndex: number,
   assetId: string
 ): Promise<PltAssetRow | null> {
+  const netCands = networkCandidates(network);
+
   const res = await pool.query(
     `
     SELECT
@@ -43,12 +46,15 @@ export async function getPltAsset(
       decimals,
       enabled
     FROM public.crp_plt_assets
-    WHERE network = $1
+    WHERE network = ANY($1)
       AND network_genesis_index = $2
       AND asset_id = $3
+    ORDER BY
+      CASE WHEN network = $4 THEN 0 ELSE 1 END,
+      network_genesis_index DESC
     LIMIT 1
     `,
-    [network, networkGenesisIndex, assetId]
+    [netCands, networkGenesisIndex, assetId, network]
   );
 
   if (!res.rows || res.rows.length === 0) return null;

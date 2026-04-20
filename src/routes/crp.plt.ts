@@ -8,6 +8,7 @@
 
 import type { FastifyInstance } from "fastify";
 import { pool } from "../db/pool";
+import { normalizeNetworkId, networkCandidates } from "../lib/networkId";
 
 export interface PltTransfer {
   block_hash: string;
@@ -80,7 +81,9 @@ export async function registerCrpPltRoutes(app: FastifyInstance): Promise<void> 
     handler: async (req, reply) => {
       const q = (req.query ?? {}) as any;
 
-      const network = q.network ? String(q.network) : undefined;
+      const rawNetwork = q.network ? String(q.network) : undefined;
+      const network = rawNetwork ? normalizeNetworkId(rawNetwork) : undefined;
+      const netCands = network ? networkCandidates(network) : [];
       const networkGenesisIndex =
         typeof q.networkGenesisIndex === "number" && Number.isFinite(q.networkGenesisIndex)
           ? Math.floor(q.networkGenesisIndex)
@@ -103,9 +106,12 @@ export async function registerCrpPltRoutes(app: FastifyInstance): Promise<void> 
       const params: any[] = [];
       let where = "WHERE 1=1";
 
-      if (network) {
-        params.push(network);
+      if (netCands.length === 1) {
+        params.push(netCands[0]);
         where += ` AND e.network = $${params.length}`;
+      } else if (netCands.length > 1) {
+        params.push(netCands);
+        where += ` AND e.network = ANY($${params.length})`;
       }
 
       if (typeof networkGenesisIndex === "number") {
