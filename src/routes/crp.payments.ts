@@ -55,7 +55,7 @@ import type {
 } from "../contracts/crpGateway";
 import { getPltAsset, getDefaultNetworkGenesisIndex } from "../store/pltAssets.pg";
 import { signJws } from "../crypto/signer";
-import { normalizeNetworkId, networkCandidates } from "../lib/networkId";
+import { normalizeNetworkId, networkCandidates, CONCORDIUM_TESTNET_CHAIN_ID, CONCORDIUM_MAINNET_CHAIN_ID } from "../lib/networkId";
 
 // For clarity in this module:
 type PaymentMatchInput = CrpMatchRequest;
@@ -105,6 +105,13 @@ function isoToUnixSeconds(iso: string): number {
   const ms = Date.parse(iso);
   if (!Number.isFinite(ms)) return Math.floor(Date.now() / 1000);
   return Math.floor(ms / 1000);
+}
+
+function canonicalChainIdForReceipt(network: string): string {
+  const normalized = normalizeNetworkId(network);
+  if (normalized === "concordium:testnet") return CONCORDIUM_TESTNET_CHAIN_ID;
+  if (normalized === "concordium:mainnet") return CONCORDIUM_MAINNET_CHAIN_ID;
+  return normalized;
 }
 
 type PltEventRow = {
@@ -810,7 +817,10 @@ export default async function routes(server: FastifyInstance) {
           ).trim(),
         },
 
-        // REQUIRED by gateway validator
+        // Canonical-first chain identity for proof payloads
+        chain_id: canonicalChainIdForReceipt(eventNetworkCanonical),
+
+        // Legacy compatibility field retained during migration
         network: String((metaContract as any).network ?? input.network ?? eventNetworkCanonical).trim(),
         asset: {
           type: "PLT",

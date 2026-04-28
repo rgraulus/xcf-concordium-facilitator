@@ -52,8 +52,12 @@ export interface CrpContractRef {
     path: string;
   };
 
-  // REQUIRED by gateway validator
+  // Canonical-first chain identity for proof payloads
+  chain_id?: string; // e.g. ccd:4221332d34e1694168c2a0c0b3fd0f27
+
+  // Legacy compatibility field retained during migration
   network: string; // e.g. concordium:testnet
+
   asset: CrpAsset;
   amount: string;
   payTo: string;
