@@ -57,9 +57,9 @@ const crpRoutes: FastifyPluginAsync = async (fastify) => {
     return {
       ok: true,
       consensus: {
-        // Matches what you've seen in logs:
-        //   "genesisIndex": 6
-        genesisIndex: 6,
+        // Default recovered Testnet genesis index.
+        // Override with CRP_DEFAULT_NETWORK_GENESIS_INDEX or CONCORDIUM_NETWORK_GENESIS_INDEX where applicable.
+        genesisIndex: 7,
       },
       blocks: {
         best: {

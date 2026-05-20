@@ -23,7 +23,7 @@ export type PltAssetRow = {
 export function getDefaultNetworkGenesisIndex(): number {
   const raw = process.env.CRP_DEFAULT_NETWORK_GENESIS_INDEX;
   const n = raw !== undefined ? Number(raw) : NaN;
-  return Number.isFinite(n) ? Math.floor(n) : 6;
+  return Number.isFinite(n) ? Math.floor(n) : 7;
 }
 
 /**

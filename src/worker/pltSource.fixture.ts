@@ -150,7 +150,7 @@ export class FixturePltSource implements PltSource {
 
 export function createFixtureSourceFromEnv(): FixturePltSource {
   const network = process.env.CRP_STREAM_NETWORK ?? "concordium:testnet";
-  const networkGenesisIndex = Number(process.env.CRP_STREAM_NETWORK_GENESIS_INDEX ?? "6") || 6;
+  const networkGenesisIndex = Number(process.env.CRP_STREAM_NETWORK_GENESIS_INDEX ?? "7") || 7;
 
   const fixturePath =
     process.env.CRP_STREAM_FIXTURE_PATH ?? "docs/fixtures/plt-events.sample.json";
