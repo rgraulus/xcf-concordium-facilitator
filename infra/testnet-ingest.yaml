@@ -1,12 +1,13 @@
 services:
   testnet-node:
     container_name: xcf-testnet-node
-    image: concordium/testnet-node:10.0.4-1
+    image: concordium/testnet-node:10.0.8-2
     platform: linux/amd64
     pull_policy: always
     restart: unless-stopped
     environment:
       - CONCORDIUM_NODE_CONNECTION_BOOTSTRAP_NODES=bootstrap.testnet.concordium.com:8888
+      - CONCORDIUM_NODE_CONNECTION_CONNECT_TO=138.197.130.233:8888,159.195.61.73:8888,217.100.137.70:8888
       - CONCORDIUM_NODE_CONSENSUS_GENESIS_DATA_FILE=/testnet-genesis.dat
       - CONCORDIUM_NODE_CONSENSUS_DOWNLOAD_BLOCKS_FROM=https://catchup.testnet.concordium.com/blocks.idx
       - CONCORDIUM_NODE_DATA_DIR=/mnt/data
@@ -32,7 +33,7 @@ services:
 
   testnet-node-collector:
     container_name: xcf-testnet-node-collector
-    image: concordium/testnet-node:10.0.4-1
+    image: concordium/testnet-node:10.0.8-2
     platform: linux/amd64
     pull_policy: always
     restart: unless-stopped
@@ -47,7 +48,7 @@ services:
 
   transaction-logger:
     container_name: xcf-transaction-logger
-    image: concordium/transaction-logger:0.14.0
+    image: concordium/transaction-logger:0.17.1
     restart: unless-stopped
     environment:
       - TRANSACTION_LOGGER_NODES=http://testnet-node:20001
