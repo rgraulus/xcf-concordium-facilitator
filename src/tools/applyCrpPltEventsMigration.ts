@@ -19,7 +19,9 @@ const DEFAULT_PLT_ASSET_NETWORK = process.env.CRP_DEFAULT_NETWORK ?? "concordium
 const DEFAULT_PLT_ASSET_NETWORK_SQL = DEFAULT_PLT_ASSET_NETWORK.replace(/\'/g, "''");
 const DEFAULT_PLT_ASSET_GENESIS_INDEX = Number.isFinite(Number(process.env.CRP_DEFAULT_NETWORK_GENESIS_INDEX))
   ? Number(process.env.CRP_DEFAULT_NETWORK_GENESIS_INDEX)
-  : 6;
+  : Number.isFinite(Number(process.env.CONCORDIUM_NETWORK_GENESIS_INDEX))
+    ? Number(process.env.CONCORDIUM_NETWORK_GENESIS_INDEX)
+    : 7;
 
 function getConnectionString(): string {
   const conn =

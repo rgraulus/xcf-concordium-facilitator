@@ -266,7 +266,7 @@ export function createConcordiumNodeConfigFromEnv(): ConcordiumNodeConfig {
 
   const networkGenesisIndex = parseIntEnv(
     "CRP_STREAM_NETWORK_GENESIS_INDEX",
-    parseIntEnv("CONCORDIUM_NETWORK_GENESIS_INDEX", 6)
+    parseIntEnv("CONCORDIUM_NETWORK_GENESIS_INDEX", 7)
   );
 
   if (note) {

@@ -33,7 +33,10 @@ export async function seedPltAssets(): Promise<void> {
   // Decimals: 6.
   // M4.2 schema: asset_id is the plain tokenId (e.g. "EUDemo"), scoped by (network, network_genesis_index).
   const network = process.env.CRP_SEED_NETWORK ?? "concordium:testnet";
-  const networkGenesisIndex = parseIntEnv("CRP_SEED_NETWORK_GENESIS_INDEX", 6);
+  const networkGenesisIndex = parseIntEnv(
+    "CRP_SEED_NETWORK_GENESIS_INDEX",
+    parseIntEnv("CONCORDIUM_NETWORK_GENESIS_INDEX", 7)
+  );
   const assetId = process.env.CRP_SEED_ASSET_ID ?? "EUDemo";
 
   const symbol = "EUDemo";

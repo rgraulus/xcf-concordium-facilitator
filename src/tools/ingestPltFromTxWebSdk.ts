@@ -17,7 +17,7 @@
 //
 //   XCF_PLT_INGEST_TX_HASH          – REQUIRED. Hex string of the transaction hash to inspect.
 //   XCF_PLT_INGEST_ASSET_ID         – Optional. Defaults to 'concordium:testnet:PLT:EUDemo'.
-//   XCF_PLT_INGEST_NETWORK_GENESIS  – Optional. Defaults to 6 (public testnet).
+//   XCF_PLT_INGEST_NETWORK_GENESIS  – Optional. Defaults to 7 (current recovered public testnet).
 //
 //   CRP_DB_CONN_STRING / DATABASE_URL – Postgres URL for XCF DB
 //
@@ -72,9 +72,9 @@ function getAssetIdFromEnv(): string {
 
 function getNetworkGenesisIndexFromEnv(): number {
   const raw = process.env.XCF_PLT_INGEST_NETWORK_GENESIS;
-  if (!raw) return 6; // default: public testnet
+  if (!raw) return Number(process.env.CONCORDIUM_NETWORK_GENESIS_INDEX ?? 7); // default: recovered public testnet
   const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0) return 6;
+  if (!Number.isFinite(n) || n < 0) return Number(process.env.CONCORDIUM_NETWORK_GENESIS_INDEX ?? 7);
   return n;
 }
 

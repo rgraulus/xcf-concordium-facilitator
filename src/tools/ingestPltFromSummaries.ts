@@ -233,7 +233,7 @@ async function main(): Promise<void> {
     // === NEW: PLT extraction preview (no DB writes) =======================
     const extractionOptions: PltExtractionOptions = {
       assetId: "concordium:testnet:PLT:EUDemo",
-      networkGenesisIndex: 6, // testnet
+      networkGenesisIndex: Number(process.env.CONCORDIUM_NETWORK_GENESIS_INDEX ?? 7), // recovered testnet default
     };
 
     const previewEvents: PltEvent[] = [];
