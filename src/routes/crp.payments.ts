@@ -833,7 +833,16 @@ export default async function routes(server: FastifyInstance) {
 
       // settlement: finalized + timestamps (unix seconds)
       const settledAt = isoToUnixSeconds(pltEvent.occurred_at);
-      const expiresAt = (match as any)?.expiry ? isoToUnixSeconds(String((match as any).expiry)) : undefined;
+      const matchedExpiresAt = (match as any)?.expiry
+        ? isoToUnixSeconds(String((match as any).expiry))
+        : undefined;
+
+      // Never issue a newly finalized receipt that is already expired.
+      // Preserve the existing expiry only when it remains after settlement.
+      const expiresAt =
+        matchedExpiresAt !== undefined && matchedExpiresAt > settledAt
+          ? matchedExpiresAt
+          : undefined;
 
       // Build the gateway-proof payload (CcdPltProofV1 shape)
       const proofPayload = {
